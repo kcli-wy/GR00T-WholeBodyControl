@@ -266,7 +266,7 @@ function install_nvidia_toolkit {
 function build_docker_image {
     echo "Building Docker image: $DEPLOY_CONTAINER"
 
-    sudo docker buildx build \
+    DOCKER_BUILDKIT=1 sudo docker build \
         --build-arg USERNAME=$USERNAME \
         --build-arg USERID=$USERID \
         --build-arg HOME_DIR=$DOCKER_HOME_DIR \
@@ -274,11 +274,8 @@ function build_docker_image {
         --cache-from $CACHE_FROM \
         -t $DEPLOY_CONTAINER \
         -f "$SCRIPT_DIR/Dockerfile.deploy" \
-        --load \
         "$PROJECT_DIR"
 
-    # Tag for persistent cache
-    # sudo docker tag $DEPLOY_CONTAINER $CACHE_FROM
     echo "Docker image build complete!"
 }
 
@@ -292,7 +289,7 @@ function build_with_cleanup {
     sudo docker rmi $DEPLOY_CONTAINER 2>/dev/null || true
     echo "Images cleaned!"
     
-    install_docker_buildx
+    # install_docker_buildx
     install_nvidia_toolkit
     build_docker_image
 }

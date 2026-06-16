@@ -95,6 +95,10 @@ RUN --mount=type=cache,target=${HOME_DIR}/.cache/uv,uid=${USERID},gid=${USERID} 
 # Use dynamic worktree name to match runtime mount path
 COPY --chown=${USERNAME}:${USERNAME} . ${HOME_DIR}/Projects/${WORKTREE_NAME}
 
+# Patch decoupled_wbc pyproject readme path for setuptools/uv editable build
+RUN sed -i '/readme\s*=\s*/d' ${HOME_DIR}/Projects/${WORKTREE_NAME}/decoupled_wbc/pyproject.toml && \
+    sed -i '/license\s*=\s*{/d' ${HOME_DIR}/Projects/${WORKTREE_NAME}/decoupled_wbc/pyproject.toml
+    
 # Install Python dependencies inside the venv with caching - split into separate commands
 RUN --mount=type=cache,target=${HOME_DIR}/.cache/uv,uid=${USERID},gid=${USERID} \
     UV_CONCURRENT_DOWNLOADS=8 uv pip install \

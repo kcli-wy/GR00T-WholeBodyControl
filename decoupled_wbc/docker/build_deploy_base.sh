@@ -32,24 +32,24 @@ sudo docker buildx inspect --bootstrap | grep Platforms
 
 # Build for multiple architectures
 echo -e "${GREEN}Starting multi-arch build...${NC}"
-sudo docker buildx build \
-    --platform linux/amd64 \
-    --file "${DOCKERFILE}" \
-    --tag "${IMAGE_NAME}:${TAG}" \
-    --push \
-    .
+#sudo docker buildx build \
+#    --platform linux/amd64 \
+#    --file "${DOCKERFILE}" \
+#    --tag "${IMAGE_NAME}:${TAG}" \
+#    --push \
+#    .
 
 # Alternative: Build and load locally (only works for single platform)
-# docker buildx build \
-#     --platform linux/amd64 \
-#     --file "${DOCKERFILE}" \
-#     --tag "${IMAGE_NAME}:${TAG}" \
-#     --load \
-#     .
+sudo docker buildx build \
+     --platform linux/arm64 \
+     --file "${DOCKERFILE}" \
+     --tag "${IMAGE_NAME}:${TAG}" \
+     --load \
+     .
 
 echo -e "${GREEN}Multi-arch build completed successfully!${NC}"
 echo -e "${GREEN}Image: ${IMAGE_NAME}:${TAG}${NC}"
-echo -e "${GREEN}Platforms: linux/amd64${NC}"
+echo -e "${GREEN}Platforms: linux/arm64${NC}"
 
 # Verify the manifest
 echo -e "${YELLOW}Verifying multi-arch manifest...${NC}"

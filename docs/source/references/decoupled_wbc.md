@@ -30,7 +30,7 @@ git clone https://github.com/NVlabs/GR00T-WholeBodyControl.git
 cd decoupled_wbc
 ```
 
-### Docker Environment
+### A. Docker Environment(pre-built)
 
 We provide a Docker image with all dependencies pre-installed.
 
@@ -53,7 +53,16 @@ Use `--root` to run as the `root` user. To run as a normal user, build the image
 ```bash
 ./docker/run_docker.sh --build
 ```
+### B. Docker build (jetson-platform local build)
+build `nvgear/ros-2` image for arm64 platform
+```
+bash ./docker/build_deploy_base.sh
+```
 
+build run as the `root` user for `decoupled_wbc` image
+```
+./docker/run_docker.sh --build --root 
+```
 ---
 
 ## Running the Control Stack
