@@ -49,7 +49,7 @@ def main(config: ControlLoopConfig):
     lower_body_policy_status_pub = ROSMsgPublisher(LOWER_BODY_POLICY_STATUS_TOPIC)
     joint_safety_status_pub = ROSMsgPublisher(JOINT_SAFETY_STATUS_TOPIC)
 
-    # Initialize telemetry
+    # Initialize telemetry, 统计最近100次循环的时间，并计算平均值和其他统计数据
     telemetry = Telemetry(window_size=100)
 
     waist_location = "lower_and_upper_body" if config.enable_waist else "lower_body"

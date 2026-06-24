@@ -105,10 +105,10 @@ class BaseConfig(ArgsConfigTemplate):
     enable_waist: bool = False
     """Whether to include waist joints in IK."""
 
-    with_hands: bool = True
+    with_hands: bool = False
     """Enable hand functionality. When False, robot operates without hands."""
 
-    high_elbow_pose: bool = False
+    high_elbow_pose: bool = True
     """Enable high elbow pose configuration for default joint positions."""
 
     verbose: bool = True
@@ -121,7 +121,7 @@ class BaseConfig(ArgsConfigTemplate):
     enable_onscreen: bool = True
     """Whether to enable onscreen rendering."""
 
-    upper_body_joint_speed: float = 1000
+    upper_body_joint_speed: float = 100
     """Upper body joint speed."""
 
     env_name: str = "default"
@@ -140,7 +140,7 @@ class BaseConfig(ArgsConfigTemplate):
     enable_gravity_compensation: bool = False
     """Enable gravity compensation using pinocchio dynamics."""
 
-    gravity_compensation_joints: Optional[list[str]] = None
+    gravity_compensation_joints: Optional[list[str]] = "arms"
     """Joint groups to apply gravity compensation to (e.g., ['arms', 'left_arm', 'right_arm'])."""
     # Teleop/Device Configuration
     body_control_device: str = "dummy"

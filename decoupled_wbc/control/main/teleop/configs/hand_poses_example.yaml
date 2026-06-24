@@ -1,0 +1,99 @@
+# Example hand pose waypoints for G1 robot
+#
+# Each waypoint defines:
+#   - left_pose/right_pose: position [x, y, z] and quaternion [w, x, y, z]
+#   - left_fingers/right_fingers: thumb, index, middle, ring, pinky (0.0=open, 1.0=closed)
+#   - base_height: robot base height in meters
+#   - navigate_cmd: [vx, vy, wz] velocity command
+#
+# Usage:
+#   python run_hand_pose_publisher.py --waypoints hand_poses_example.yaml --duration 10.0 --loop
+
+waypoints:
+  # Waypoint 1: Arms at sides, hands open
+  - left_pose:
+      position: [0.0, 0.2, 0.0]  # x=forward, y=left, z=up
+      quaternion: [1.0, 0.0, 0.0, 0.0]  # [w, x, y, z] - identity rotation
+    right_pose:
+      position: [0.0, -0.2, 0.0]
+      quaternion: [1.0, 0.0, 0.0, 0.0]
+    left_fingers:
+      thumb: 0.0
+      index: 0.0
+      middle: 0.0
+      ring: 0.0
+      pinky: 0.0
+    right_fingers:
+      thumb: 0.0
+      index: 0.0
+      middle: 0.0
+      ring: 0.0
+      pinky: 0.0
+    base_height: 0.74
+    navigate_cmd: [0.0, 0.0, 0.0]
+
+  # Waypoint 2: Arms forward, hands open
+  - left_pose:
+      position: [0.3, 0.15, 0.3]
+      quaternion: [0.707, 0.0, 0.707, 0.0]  # 90° pitch (palm down)
+    right_pose:
+      position: [0.3, -0.15, 0.3]
+      quaternion: [0.707, 0.0, 0.707, 0.0]
+    left_fingers:
+      thumb: 0.0
+      index: 0.0
+      middle: 0.0
+      ring: 0.0
+      pinky: 0.0
+    right_fingers:
+      thumb: 0.0
+      index: 0.0
+      middle: 0.0
+      ring: 0.0
+      pinky: 0.0
+    base_height: 0.74
+    navigate_cmd: [0.0, 0.0, 0.0]
+
+  # Waypoint 3: Arms up, grasping pose
+  - left_pose:
+      position: [0.2, 0.2, 0.5]
+      quaternion: [0.5, 0.5, 0.5, 0.5]  # 90° roll + 90° pitch
+    right_pose:
+      position: [0.2, -0.2, 0.5]
+      quaternion: [0.5, -0.5, 0.5, -0.5]
+    left_fingers:
+      thumb: 0.8
+      index: 0.9
+      middle: 0.9
+      ring: 0.9
+      pinky: 0.9
+    right_fingers:
+      thumb: 0.8
+      index: 0.9
+      middle: 0.9
+      ring: 0.9
+      pinky: 0.9
+    base_height: 0.74
+    navigate_cmd: [0.0, 0.0, 0.0]
+
+  # Waypoint 4: Arms forward, grasping
+  - left_pose:
+      position: [0.4, 0.1, 0.3]
+      quaternion: [0.707, 0.0, 0.707, 0.0]
+    right_pose:
+      position: [0.4, -0.1, 0.3]
+      quaternion: [0.707, 0.0, 0.707, 0.0]
+    left_fingers:
+      thumb: 1.0
+      index: 1.0
+      middle: 1.0
+      ring: 1.0
+      pinky: 1.0
+    right_fingers:
+      thumb: 1.0
+      index: 1.0
+      middle: 1.0
+      ring: 1.0
+      pinky: 1.0
+    base_height: 0.74
+    navigate_cmd: [0.0, 0.0, 0.0]

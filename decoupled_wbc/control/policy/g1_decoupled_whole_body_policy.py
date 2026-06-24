@@ -26,6 +26,7 @@ class G1DecoupledWholeBodyPolicy(Policy):
         self.upper_body_policy = upper_body_policy
         self.last_goal_time = time_module.monotonic()
         self.is_in_teleop_mode = False  # Track if lower body is in teleop mode
+        self.torso_orientation_rpy_cmd = None  # Desired torso RPY from teleop (degrees)
 
     def set_observation(self, observation):
         # Upper body policy is open loop (just interpolation), so we don't need to set the observation
@@ -75,6 +76,10 @@ class G1DecoupledWholeBodyPolicy(Policy):
         has_teleop_commands = ("navigate_cmd" in goal) or ("base_height_command" in goal)
         self.is_in_teleop_mode = has_teleop_commands  # Track teleop state for timeout safety
         self.lower_body_policy.set_use_teleop_policy_cmd(has_teleop_commands)
+
+        # Store torso orientation command from teleop if present
+        if "torso_orientation_rpy" in goal:
+            self.torso_orientation_rpy_cmd = goal["torso_orientation_rpy"]
 
         # Lower body goal keys
         lower_body_keys = [
@@ -133,8 +138,11 @@ class G1DecoupledWholeBodyPolicy(Policy):
         yaw_only_waist_from_torso = waist_yaw_only_rotation.T @ torso_orientation
         torso_orientation_rpy = rpy.matrixToRpy(yaw_only_waist_from_torso)
 
+        # Use teleop command if available, otherwise use computed state
+        torso_rpy_for_lower = self.torso_orientation_rpy_cmd if self.torso_orientation_rpy_cmd is not None else torso_orientation_rpy
+
         lower_body_action = self.lower_body_policy.get_action(
-            time, q_arms, base_height_command, torso_orientation_rpy, interpolated_navigate_cmd
+            time, q_arms, base_height_command, torso_rpy_for_lower, interpolated_navigate_cmd
         )
 
         # If pelvis is both in upper and lower body, lower body policy takes preference

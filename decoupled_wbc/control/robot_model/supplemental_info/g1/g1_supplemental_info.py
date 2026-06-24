@@ -283,11 +283,11 @@ class G1SupplementalInfo(RobotSupplementalInfo):
         if elbow_pose == ElbowPose.HIGH:
             default_joint_q = {
                 "shoulder_roll": {"left": 0.5, "right": -0.5},
-                "shoulder_pitch": {"left": -0.2, "right": -0.2},
-                "shoulder_yaw": {"left": -0.5, "right": 0.5},
-                "wrist_roll": {"left": -0.5, "right": 0.5},
-                "wrist_yaw": {"left": 0.5, "right": -0.5},
-                "wrist_pitch": {"left": -0.2, "right": -0.2},
+                # "shoulder_pitch": {"left": -0.2, "right": -0.2},
+                "shoulder_yaw": {"left": 0.3, "right": -0.3},
+                # "wrist_roll": {"left": -0.5, "right": 0.5},
+                # "wrist_yaw": {"left": 0.5, "right": -0.5},
+                # "wrist_pitch": {"left": -0.2, "right": -0.2},
             }
         else:  # ElbowPose.LOW
             default_joint_q = {

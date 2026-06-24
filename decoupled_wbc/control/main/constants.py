@@ -8,6 +8,15 @@ LOCO_NAV_TASK_STATUS_TOPIC = "NavigationPolicy/task_status"
 LOWER_BODY_POLICY_STATUS_TOPIC = "ControlPolicy/lower_body_policy_status"
 JOINT_SAFETY_STATUS_TOPIC = "ControlPolicy/joint_safety_status"
 
+# Stretcher task topics
+STRETCHER_NAV_CMD_TOPIC = "StretcherTask/nav_cmd"  # VLN navigation command
+STRETCHER_POSE_TOPIC = "StretcherTask/pose"  # Pose estimation output
+STRETCHER_TASK_STATUS_TOPIC = "StretcherTask/status"  # Task status feedback
+
+# Camera topics
+CAMERA_CHEST_TOPIC = "camera/chest"  # Chest camera for navigation (RGB only)
+CAMERA_HEAD_TOPIC = "camera/head"   # Head camera for pose estimation (RGB + Depth)
+
 
 DEFAULT_NAV_CMD = [0.0, 0.0, 0.0]
 DEFAULT_BASE_HEIGHT = 0.74
