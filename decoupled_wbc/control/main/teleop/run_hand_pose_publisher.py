@@ -576,7 +576,7 @@ Examples:
         "--left-pos",
         type=float,
         nargs=3,
-        default=[0.15, 0.2, 0.1],
+        default=[0.15, 0.2, 0],
         metavar=("X", "Y", "Z"),
         help="Left hand position [x, y, z] (default: 0.2 0.2 0.0)",
     )
@@ -592,7 +592,7 @@ Examples:
         "--right-pos",
         type=float,
         nargs=3,
-        default=[0.15, -0.2, 0.1],
+        default=[0.15, -0.2, 0],
         metavar=("X", "Y", "Z"),
         help="Right hand position [x, y, z] (default: 0.2 -0.2 0.0)",
     )

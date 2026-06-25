@@ -25,6 +25,7 @@ from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Dict, List, Optional, Type
 
 import numpy as np
@@ -113,8 +114,14 @@ class TaskContext:
     default_left_wrist_position: Optional[np.ndarray] = None   # shape (3,)
     default_right_wrist_position: Optional[np.ndarray] = None  # shape (3,)
 
-    # 当前腰部 pitch 实测值 (弧度), 由 controller 订阅 G1Env/env_state_act 持续更新
-    # 用于把世界系下的手腕目标朝向补偿到 pelvis 系 (IK 求解参考系)
+    # 当前 pelvis 在世界系的 pitch 实测值 (弧度, Y 轴), 由 controller 订阅
+    # G1Env/env_state_act 的 floating_base_pose 四元数解出并持续更新.
+    # 用于把世界系下的手腕目标朝向补偿到 pelvis 系 (IK 求解参考系是 pelvis,
+    # 而 pelvis 在世界系的倾斜由腿关节造成, 不在 IK 模型内, 故需外部补偿).
+    current_pelvis_pitch: float = 0.0
+    # 当前 waist pitch 关节角实测值 (弧度), 由 obs["q"][waist_pitch_idx] 读取.
+    # torso 相对 pelvis 的 waist 旋转改变了末端坐标系 rpy, 需与 pelvis_pitch 一起
+    # 进入 orientation 补偿 (相加). 符号实机验.
     current_waist_pitch: float = 0.0
 
 
@@ -461,7 +468,14 @@ class GrabbingPhase(BasePhase):
 
         print(f"Running grab script: {self.grab_script}")
         try:
-            subprocess.Popen([sys.executable, self.grab_script])
+            # 按扩展名选执行器: .sh → bash, .py → 当前 python, 其它 → 直接 exec (依赖 shebang)
+            if self.grab_script.endswith(".sh"):
+                cmd = ["bash", self.grab_script]
+            elif self.grab_script.endswith(".py"):
+                cmd = [sys.executable, self.grab_script]
+            else:
+                cmd = [self.grab_script]
+            subprocess.Popen(cmd)
             print("Grab script started")
         except Exception as e:
             print(f"ERROR: Failed to run grab script: {e}")
@@ -672,8 +686,10 @@ class StretcherTaskController:
 
         # Get joint group indices
         self.upper_body_indices = self.robot_model.get_joint_group_indices("upper_body")
-        # waist 关节组顺序为 [yaw, roll, pitch] (见 g1_supplemental_info.py:60-62);
-        # 取 pitch 在完整 q 向量中的索引, 用于 _update_robot_state 解析实测值
+        # waist 关节组顺序为 [yaw, roll, pitch] (见 g1_supplemental_info.py); 取 pitch
+        # 在完整 q 向量中的索引, _update_robot_state 解析 waist_pitch 实测值.
+        # waist_pitch 用于 _compute_wrist_orientation 的 orientation 补偿 (与 pelvis_pitch
+        # 相加), 因 torso 相对 pelvis 的 waist 旋转改变了末端 rpy. 符号实机验.
         self.waist_pitch_idx = self.robot_model.get_joint_group_indices("waist")[2]
 
         # Initialize phases
@@ -865,17 +881,29 @@ class StretcherTaskController:
         )
 
     def _update_robot_state(self):
-        """从 G1Env/env_state_act 读取最新 q, 更新 context.current_waist_pitch.
+        """从 G1Env/env_state_act 读实测状态, 更新 pelvis_pitch 与 waist_pitch.
 
-        消息缺失时保留旧值 (隐式 fallback), 不会导致 IK 求解中断.
+        - pelvis_pitch: 从 floating_base_pose 四元数解 Y 轴欧拉角 (pelvis 在世界系的
+          倾斜, 由腿关节造成, 不在 IK 模型内).
+        - waist_pitch: 从 obs["q"][waist_pitch_idx] 读 (torso 相对 pelvis 的旋转,
+          改变末端坐标系 rpy).
+        两者相加进 _compute_wrist_orientation 的 orientation 补偿. 任一缺失保留旧值
+        (隐式 fallback). 符号实机验.
+
+        floating_base_pose = [x, y, z, w, x, y, z] (MuJoCo free-joint 序, 四元数 scalar-first).
         """
         state_msg = self.state_subscriber.get_msg()
         if state_msg is None:
             return
+        base_pose = state_msg.get("floating_base_pose")
+        if base_pose is not None:
+            quat_wxyz = np.asarray(base_pose[3:7], dtype=float)  # [w, x, y, z]
+            # SciPy 用 [x, y, z, w]
+            r = R.from_quat([quat_wxyz[1], quat_wxyz[2], quat_wxyz[3], quat_wxyz[0]])
+            self.context.current_pelvis_pitch = float(r.as_euler("xyz", degrees=False)[1])
         q = state_msg.get("q")
-        if q is None:
-            return
-        self.context.current_waist_pitch = float(q[self.waist_pitch_idx])
+        if q is not None:
+            self.context.current_waist_pitch = float(q[self.waist_pitch_idx])
 
     def _compute_wrist_orientation(self, handle: StretcherHandle, side: str) -> np.ndarray:
         """计算 IK 用的手腕 4x4 目标位姿 (pelvis 系下).
@@ -883,17 +911,25 @@ class StretcherTaskController:
         语义:
         - 目标朝向在 *世界系* 下固定为 "绕世界 Y +90°" (手腕垂直向下),
           左右手共用同一矩阵 (零位时左右腕朝向相同, IK 会自然解出对称关节角).
-        - IK 求解参考系是 pelvis (见 body_ik_solver.py: pin.SE3 喂给 Pink FrameTask).
-          pelvis 自身随 waist_pitch 旋转, 所以需要把世界系朝向左乘 R_y(-waist_pitch)
-          补偿回 pelvis 系: R_pelvis_target = R_y(-waist_pitch) · R_y(+90°)
-        - position 不补偿, 直接用 handle.position (调用方保证它已经在 pelvis 系下).
+        - IK 求解参考系是 pelvis (见 body_ik_solver.py: pin.SE3 喂给 Pink FrameTask),
+          而 IK 模型把 pelvis 当固定根 (set_floating_base=False). 弯腰时两个量改变末端
+          朝向, 需一起补偿 (相加):
+          (1) pelvis_pitch: pelvis 在世界系的倾斜 (腿关节造成, 不在 IK 模型内);
+          (2) waist_pitch: torso 相对 pelvis 的旋转, 改变末端坐标系 rpy.
+          把世界系朝向左乘 R_y(-(pelvis_pitch + waist_pitch)) 换到 pelvis 系:
+          R_pelvis_target = R_y(-(pelvis_pitch + waist_pitch)) · R_y(+90°)
+        - position 不补偿, 直接用 handle.position: pose_robot_matrix 的 camera_to_robot
+          是静态全零位标定 → position 在"全零位 pelvis 系"; IK 模型 set_floating_base=False
+          + reduced model 锁 waist/legs 在 q0 → IK pelvis 系 = 全零位 pelvis 系, 两系相同.
         - handle.orientation 不再被读取 (FoundationPose++ 给的朝向估计当前不可靠).
         - side 参数保留作占位, 当前未使用.
+        - 符号: 先按 R_y(-(pelvis_pitch+waist_pitch)) (相加取负) 处理, 实机验; 不对翻负号.
         """
         del side  # 当前左右手用同一朝向矩阵, IK 靠 frame name 区分左右臂
 
+        total_pitch = self.context.current_pelvis_pitch + self.context.current_waist_pitch
         R_world_target = R.from_euler('y', 90, degrees=True)
-        R_compensate = R.from_euler('y', -self.context.current_waist_pitch, degrees=False)
+        R_compensate = R.from_euler('y', -total_pitch, degrees=False)
         R_pelvis_target = R_compensate * R_world_target
 
         T = np.eye(4)
@@ -953,6 +989,16 @@ class StretcherTaskController:
             f"[IK-target] right = [{right_handle.position[0]:+.3f}, "
             f"{right_handle.position[1]:+.3f}, {right_handle.position[2]:+.3f}]  ({right_src})"
         )
+        # debug: 实测 pelvis 世界系 pitch (弧度 → 度). 读自 G1Env/env_state_act 的
+        # floating_base_pose 四元数 (_update_robot_state 解出存 context.current_pelvis_pitch),
+        # 是 IK 朝向补偿的输入, 非任何 command. 物理含义: pelvis 相对世界系绕 Y 的前倾角
+        # (由腿关节造成). 符号实机验: 弯腰时该值应为正, 不对则翻 _compute_wrist_orientation 的负号.
+        pelvis_pitch_deg = np.degrees(self.context.current_pelvis_pitch)
+        waist_pitch_deg = np.degrees(self.context.current_waist_pitch)
+        total_pitch_deg = np.degrees(self.context.current_pelvis_pitch + self.context.current_waist_pitch)
+        print(f"[IK-target] pelvis pitch = {pelvis_pitch_deg:+.1f}° (measured, from floating_base_pose)")
+        print(f"[IK-target] waist pitch  = {waist_pitch_deg:+.1f}° (measured, from q[waist_pitch_idx])")
+        print(f"[IK-target] total pitch  = {total_pitch_deg:+.1f}° (sum, used for orientation compensation)")
 
         body_data = {
             "left_wrist_yaw_link": left_wrist,
@@ -1196,20 +1242,21 @@ Valid phases: idle, navigating, fine_tuning, approaching, grabbing, standing_up,
     parser.add_argument(
         "--grab-duration",
         type=float,
-        default=3.0,
-        help="[Grabbing] settle 结束后 IK 抓取时长 (秒, default: 3.0, 不含 settle)",
+        default=4.0,
+        help="[Grabbing] settle 结束后 IK 抓取时长 (秒, default: 4.0, 不含 settle)",
     )
     parser.add_argument(
         "--move-duration",
         type=float,
-        default=0.5,
-        help="[Grabbing] IK 目标运动持续时间 (秒, default: 0.5), 控制 InterpolationPolicy 平滑过渡",
+        default=1.0,
+        help="[Grabbing] IK 目标运动持续时间 (秒, default: 1.0), 控制 InterpolationPolicy 平滑过渡",
     )
     parser.add_argument(
         "--grab-script",
         type=str,
-        default=None,
-        help="[Grabbing] 抓取脚本路径, GRABBING 50% 进度时 subprocess 启动",
+        default=str(Path(__file__).parent.parent.parent.parent / "brainco-hand-sdk/python/revo2" / "dual_thumb_aux.py"),
+        help="[Grabbing] 抓取脚本路径, GRABBING 50% 进度时 subprocess 启动 "
+             "(default: scripts/grab.sh, 相对本脚本所在目录; .sh 用 bash 执行, .py 用 python 执行)",
     )
     # handle 缺失时的 IK fallback position (左右独立)
     parser.add_argument(

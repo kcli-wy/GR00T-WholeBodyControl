@@ -77,8 +77,9 @@ State machine-based controller that orchestrates the entire task.
 - `NAVIGATING`: Phase 1 - VLN 远场导航到担架附近 (订阅 `StretcherTask/nav_cmd`)
 - `FINE_TUNING`: Phase 2 - 基于 handle 位姿的近场 PD 微调 (订阅两个 FoundationPose++ topic, 自算 `nav_cmd`, 收敛后转下一阶段)
 - `APPROACHING`: Phase 3a - 下蹲 + 弯腰 (同步插值 `base_height` / `torso_rpy`)
-- `GRABBING`: Phase 3b - settle 等位姿稳定 → 对最近 N 帧取均值锁定 handle → IK 求解抓取
-- `STANDING_UP`: Phase 4 - 抬起担架 (反向插值, 双手保持抓握, handle z 线性插值上升)
+- `GRABBING`: Phase 3b - settle 等位姿稳定 → 对最近 N 帧取均值锁定 handle → IK 求解抓取; 50% 进度非阻塞启动 `scripts/grab.sh` (手部抓取)
+- `STANDING_UP`: Phase 4 - 抬起担架 (反向插值, 双手保持抓握, handle z 线性插值上升;
+  orientation 仍用 `pelvis_pitch + waist_pitch` 补偿保持手腕垂直向下)
 - `COMPLETED`: Task finished
 
 **Usage:**
@@ -93,7 +94,7 @@ python run_stretcher_task.py --interface sim --start-phase grabbing
 python run_stretcher_task.py --interface sim \
     --target-height 0.34 \
     --target-torso-rpy 0 60 0 \
-    --grab-script grab_stretcher.py
+    --grab-script scripts/grab.sh
 ```
 
 ### 2. Communication Test (`test_stretcher_comm.py`)
@@ -127,7 +128,7 @@ python test_stretcher_comm.py --test full
 | `FoundationPose/pose/left_handle` | ByteMultiArray (msgpack) | FoundationPose++ | Task Controller |
 | `FoundationPose/pose/right_handle` | ByteMultiArray (msgpack) | FoundationPose++ | Task Controller |
 | `StretcherTask/nav_cmd` | ByteMultiArray (msgpack) | VLN Model | Task Controller (NAVIGATING) |
-| `G1Env/env_state_act` | ByteMultiArray (msgpack) | Robot Control Loop | Task Controller (读 waist_pitch) |
+| `G1Env/env_state_act` | ByteMultiArray (msgpack) | Robot Control Loop | Task Controller (读 pelvis_pitch + waist_pitch) |
 | `StretcherTask/status` | ByteMultiArray (msgpack) | Task Controller | External |
 | `ControlPolicy/upper_body_pose` | ByteMultiArray (msgpack) | Task Controller | Robot Control Loop |
 
@@ -148,7 +149,7 @@ python run_realsense_publisher.py --camera head
 python /path/to/FoundationPose-plus-plus/src/obj_pose_track_ros2.py \
     --objects_json test_data/stretcher_handle.json
 
-# 3. 启动机器人控制循环 (提供 G1Env/env_state_act 给 controller 读 waist_pitch)
+# 3. 启动机器人控制循环 (提供 G1Env/env_state_act 给 controller 读 pelvis_pitch + waist_pitch)
 python run_g1_control_loop.py
 
 # 4. 启动任务控制器
@@ -249,11 +250,17 @@ ros2 topic hz FoundationPose/pose/right_handle
 ```
 
 > **controller 只读 `pose_robot_matrix`**: `StretcherHandle.from_msg()` 取该矩阵的
-> 平移列 `[:3, 3]` 作为 handle position (机器人坐标系 = IK 求解参考系 pelvis 系,
-> 由 `camera_to_robot` 静态变换完成, 已处理)。
+> 平移列 `[:3, 3]` 作为 handle position。
 > `pose_camera_matrix` / `position` / `pose_6d` / `orientation_euler_rad` 均不读 ——
-> 手腕目标朝向不走 FP++ 估计, 而是固定世界系 `R_y(90°)` + 实测 `waist_pitch` 补偿
-> (见 `run_stretcher_task.py:_compute_wrist_orientation`)。
+> 手腕目标朝向不走 FP++ 估计, 而是固定世界系 `R_y(90°)` + 实测
+> `(pelvis_pitch + waist_pitch)` 相加补偿 (见下方 "IK 目标朝向补偿" 一节,
+> 及 `run_stretcher_task.py:_compute_wrist_orientation`)。
+>
+> **position 不补偿**: `camera_to_robot` 是**静态全零位标定** (机器人所有关节角=0 时标定),
+> 故 `pose_robot_matrix` 的 position 永远落在"全零位 pelvis 系" (站立、水平、waist=0),
+> 不随蹲下/waist 改变。而 IK 模型 `set_floating_base=False` 把 pelvis 钉在原点、reduced
+> model 把 waist/legs 锁死在 q0 (全零位) → **IK pelvis 系 = 全零位 pelvis 系**, 两系相同,
+> position 直接透传即可, 无需任何补偿。
 
 ### Task Status (`StretcherTask/status`)
 ```python
@@ -283,7 +290,7 @@ ros2 topic hz FoundationPose/pose/right_handle
 ┌─────────────┐ nav_cmd│                      │      │
 │  VLN Model  │───────▶│  (FineTuning: PD     │      │ G1Env/env_state_act
 └─────────────┘        │   自算 nav_cmd)       │────▶ Robot Control Loop
-                       │  GRABBING: lock+IK   │◀─────┘ (waist_pitch 补偿)
+                       │  GRABBING: lock+IK   │◀─────┘ (pelvis_pitch + waist_pitch 补偿)
                        └──────────┬───────────┘
                                   │
                                   ▼
@@ -293,8 +300,9 @@ ros2 topic hz FoundationPose/pose/right_handle
 ```
 
 > 注: 不再有 pose bridge。FoundationPose++ 直接发两个独立 topic 给 controller;
-> controller 还订阅 `G1Env/env_state_act` 读实测 `waist_pitch`, 用于 IK 目标朝向
-> (世界系 R_y(90°)) 补偿到 pelvis 系。
+> controller 还订阅 `G1Env/env_state_act` 读实测 `pelvis_pitch` (floating_base_pose 四元数,
+> 腿关节造成) 与 `waist_pitch` (q[waist_pitch_idx], torso 相对 pelvis), 两者相加用于 IK
+> 目标朝向 (世界系 R_y(90°)) 补偿到 pelvis 系 (见下方 "IK 目标朝向补偿" 一节)。
 
 ## RealSense Camera Configuration
 
@@ -341,16 +349,93 @@ Auto-calibrated from RealSense SDK:
 ### Pose Estimation Integration (FoundationPose++)
 - Controller 直接订阅两个独立 topic `FoundationPose/pose/{left,right}_handle`
 - 每个 handle 一条消息, controller 读 `pose_robot_matrix[:3,3]` 作 position
-- 朝向不读 FP++ 估计 —— 固定世界系 `R_y(90°)` + `G1Env/env_state_act` 的实测 `waist_pitch` 补偿到 pelvis 系
+- 朝向不读 FP++ 估计 —— 固定世界系 `R_y(90°)` + `G1Env/env_state_act` 的实测
+  `(pelvis_pitch + waist_pitch)` 相加补偿到 pelvis 系 (见下方 "IK 目标朝向补偿")
 - 多机区分: `--pose-topic-namespace <prefix>` 覆盖 topic 前缀
 - `GRABBING` 阶段对最近 N 帧取均值锁定 handle, 之后全程不刷新 (担架静止 + pose 抖动)
 
+### IK 目标朝向补偿 (`_compute_wrist_orientation`)
+
+手腕目标朝向在世界系下固定为 `R_y(90°)` (手腕垂直向下), 但 IK 在 pelvis 系求解
+(robot_model `set_floating_base=False`, pelvis 是固定根, "Pink 的 world" = pelvis 系)。
+弯腰时两个量改变末端朝向, 需**相加**补偿:
+
+| pitch | 来源 | 物理含义 |
+|-------|------|----------|
+| `pelvis_pitch` | `obs["floating_base_pose"][3:7]` 四元数 (`[w,x,y,z]`) 解 Y 轴欧拉角 | pelvis 在世界系的倾斜, 由**腿关节**造成 (不在 IK 模型内) |
+| `waist_pitch` | `obs["q"][waist_pitch_idx]` (waist 关节组 `[yaw, roll, pitch]` 第 3 个) | torso 相对 pelvis 的旋转, 改变末端坐标系 rpy |
+
+补偿公式 (`_compute_wrist_orientation`):
+
+```python
+total_pitch = current_pelvis_pitch + current_waist_pitch
+R_pelvis_target = R_y(-total_pitch) · R_y(90°)   # 先按负号, 实机验
+T[:3, :3] = R_pelvis_target
+T[:3, 3] = handle.position                       # position 不补偿 (见下)
+```
+
+**注:**
+
+- **符号**: 先按 `R_y(-total_pitch)` (相加取负) 实现, **实机验证**。弯腰时若手腕方向反,
+  翻 `_compute_wrist_orientation` 里 `R.from_euler('y', -total_pitch)` 的负号为正 (一行改动)。
+- **position 不补偿**: `pose_robot_matrix` 的 `camera_to_robot` 是**静态全零位标定** →
+  position 永远在"全零位 pelvis 系"; IK 模型 `set_floating_base=False` + reduced model 锁
+  waist/legs 在 q0 → IK pelvis 系 = 全零位 pelvis 系。两系相同, position 直接透传。
+- **左右手朝向相同**: 补偿矩阵不依赖 handle, 只依赖 `total_pitch`, 左右手共用同一矩阵
+  (IK 靠 frame name 区分左右臂)。
+
+### 坐标系梳理 (5 个系)
+
+| # | 坐标系 | 说明 |
+|---|--------|------|
+| 1 | 世界系 (MuJoCo base) | 机器人运动的绝对参考; `floating_base_pose` 表达在此系 |
+| 2 | 真实 pelvis 系 | 真实机器人 pelvis 刚体, 随腿关节相对世界系倾斜 (`pelvis_pitch`) |
+| 3 | IK pelvis 系 | IK 模型把 pelvis 钉在原点 (`set_floating_base=False`); **= 全零位 pelvis 系**; IK 在此系求解 |
+| 4 | 全零位 pelvis 系 (静态标定) | `camera_to_robot` 全零位标定的目标系; `pose_robot_matrix` 的 position 落在此系; **= 系 (3)**, 故 position 不补 |
+| 5 | torso 系 | torso 刚体, 随 waist 相对 pelvis 旋转 (`waist_pitch`); 相机的父系 |
+
+**关键关系**:
+- **站立时**:(1)≈(2)≈(3)=(4), torso(5)=pelvis(waist=0) → 全部重合, 验证 IK offset 通过。
+- **蹲下时**:(2) 相对 (1) 倾斜 `pelvis_pitch`, (5) 相对 (2) 转 `waist_pitch`; 但 (3)=(4)
+  始终相同 (IK 模型 pelvis 钉原点 + waist 锁 q0)。
+
+**为何 orientation 补两层、position 不补**:
+- **orientation** 目标对齐**世界系 (1)** (手腕垂直向下), 蹲下时真实末端朝向 = (1) 下表达,
+  需经 (2) `pelvis_pitch` + (5) `waist_pitch` 两层旋转换到 IK pelvis 系 (3) → 补两层。
+- **position** 来自 `pose_robot_matrix` 的 (4) 系, 而 (4)=(3), 直接用, 不补。
+
+### IK 模型与求解
+
+- robot_model: `instantiate_g1_robot_model(waist_location="lower_body", high_elbow_pose=False)`,
+  `set_floating_base=False` (pelvis 固定根)。
+- `TeleopRetargetingIK(body_active_joint_groups=["upper_body"])` → `ReducedRobotModel` 把
+  waist/legs 锁死在 q0 (全零位), **IK 只解双臂 14 关节 + 双手**。
+- 目标 frame: `left_wrist_yaw_link` / `right_wrist_yaw_link` (`hand_frame_names`)。
+- **wrist offset**: `TeleopRetargetingIK` 默认 `wrist_x_offset=0.13`, IK 内部把"延伸 frame
+  目标"换算回 wrist frame 目标 (`_apply_wrist_offset`), 即 IK 实际让"手腕末端往外 0.13m
+  的点"落到给定的 handle position 上。offset 方向已实机验证。
+
+**debug 输出** (GRABBING/STANDING_UP 调 `_solve_ik_for_handles` 时打印):
+
+```
+[IK-target] left  = [+0.450, +0.300, +0.120]  (locked)
+[IK-target] right = [+0.450, -0.300, +0.120]  (locked)
+[IK-target] pelvis pitch = +35.0° (measured, from floating_base_pose)
+[IK-target] waist pitch  = +25.0° (measured, from q[waist_pitch_idx])
+[IK-target] total pitch  = +60.0° (sum, used for orientation compensation)
+```
+
+`left/right` 行末尾 `(src)` 标来源: `locked` (GRABBING/STANDING_UP 锁定值) /
+`live` (FineTuning/settle 实时值) / `default` (handle 缺失 fallback)。
+
 ### Grab Script
-The grab script should:
-1. Be a standalone Python script
-2. Control the robot's hand actuators
-3. Handle the actual grasping motion
-4. Can be specified via `--grab-script` argument
+GRABBING 阶段 50% 进度时, `subprocess.Popen` **非阻塞**启动抓取脚本 (后台运行, 不卡 50Hz 主循环):
+- 默认 `scripts/grab.sh` (相对 `run_stretcher_task.py` 所在目录, 用 `__file__` 解析, 不依赖 cwd)。
+- **按扩展名选执行器**: `.sh` → `bash <script>`, `.py` → `python <script>`, 其它 → 直接 exec (依赖 shebang)。
+- 脚本要求:
+  1. 独立可执行 (`.sh` 需 shebang, 或靠上面的 bash 调用)。
+  2. 控制手部执行器完成实际抓取动作。
+  3. 可用 `--grab-script <path>` 覆盖路径。
 
 ## CLI 参数 (`run_stretcher_task.py`)
 
@@ -395,7 +480,7 @@ The grab script should:
 | `--grab-lock-window` | `10` | 锁定时取均值的最近帧数 |
 | `--grab-duration` | `3.0` | settle 后 IK 抓取时长 (秒, 不含 settle) |
 | `--move-duration` | `0.5` | IK 目标运动持续时间 (InterpolationPolicy 平滑过渡) |
-| `--grab-script` | None | 抓取脚本路径, 50% 进度时 subprocess 启动 |
+| `--grab-script` | `scripts/grab.sh` | 抓取脚本路径, 50% 进度时 subprocess 启动 (默认 `scripts/grab.sh`, 相对本脚本所在目录; `.sh` 用 bash 执行, `.py` 用 python 执行) |
 | `--default-left-wrist-position` | `0.25 0.3 0.1` | 左 handle 缺失 fallback position (pelvis 系, 米) |
 | `--default-right-wrist-position` | `0.25 -0.3 0.1` | 右 handle 缺失 fallback position |
 
@@ -414,6 +499,8 @@ control/main/teleop/
 ├── test_stretcher_comm.py       # Test VLN/Pose communication with mock publishers
 ├── test_camera_publisher.py     # Test camera topic communication
 ├── test_camera_sub.py           # Camera subscriber for testing reception
+├── scripts/
+│   └── grab.sh                  # 手部抓取脚本 (GRABBING 50% 时 subprocess 启动)
 └── STRETCHER_TASK_README.md     # This file
 
 control/main/

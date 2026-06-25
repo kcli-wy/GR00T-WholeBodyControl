@@ -174,8 +174,8 @@ class CommunicationTester:
                 t = time.monotonic() - start_time
 
                 # Simulate handle poses
-                left_pos = [0.5, 0.3, 0.8]
-                right_pos = [0.5, -0.3, 0.8]
+                left_pos = [0.3, 0.25, -0.0]
+                right_pos = [0.3, -0.25, 0.0]
 
                 # Simulate fine-tuning navigation
                 nav_cmd = [0.0, 0.1, 0.0]  # Slight lateral movement
@@ -195,8 +195,8 @@ class CommunicationTester:
 
             # Signal ready to grab
             self.mock_pose.publish_test_pose(
-                left_position=[0.4, 0.25, 0.8],
-                right_position=[0.4, -0.25, 0.8],
+                left_position=[0.3, 0.25, 0.0],
+                right_position=[0.3, -0.25, 0.0],
                 ready_to_grab=True,
             )
             print("\n✓ Pose estimation communication test complete")
