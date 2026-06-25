@@ -25,6 +25,7 @@ class TeleopRetargetingIK(Policy):
         enable_visualization=False,
         body_active_joint_groups: Optional[List[str]] = None,
         body_ik_solver_settings_type: str = "default",
+        wrist_x_offset: float = 0.13,
     ):
         # initialize the body
         if body_active_joint_groups is not None:
@@ -49,6 +50,14 @@ class TeleopRetargetingIK(Policy):
         # Hand IK solvers are hand specific, so we pass them in the constructor
         self.left_hand_ik_solver = left_hand_ik_solver
         self.right_hand_ik_solver = right_hand_ik_solver
+
+        # Wrist frame offset: target pose is interpreted as a frame displaced from
+        # the wrist by wrist_x_offset along the wrist's local x-axis. We precompute
+        # the inverse homogeneous transform to map the displaced-frame target back
+        # to the wrist-frame target used by the body IK solver.
+        self.wrist_x_offset = wrist_x_offset
+        self._wrist_offset_inv = np.eye(4)
+        self._wrist_offset_inv[:3, 3] = np.array([-wrist_x_offset, 0.0, 0.0])
 
         # enable visualizer
         self.enable_visualization = enable_visualization
@@ -79,6 +88,38 @@ class TeleopRetargetingIK(Policy):
 
         return target_robot_joints
 
+    def _apply_wrist_offset(self, body_target_pose: dict) -> dict:
+        """
+        Convert displaced-frame targets back to wrist-frame targets.
+
+        The solver task is registered on the wrist frame (e.g. left_wrist_yaw_link).
+        When ``wrist_x_offset > 0``, the provided target pose is interpreted as the
+        desired pose of a frame displaced by ``wrist_x_offset`` along the wrist's
+        local x-axis. To make the wrist-frame task reach the equivalent pose, we map
+        the target back by the inverse offset:
+
+            T_wrist_target = T_displaced_target @ inv(T_offset)
+
+        Non-wrist targets are copied through unchanged.
+        """
+        if self.wrist_x_offset == 0.0 or not body_target_pose:
+            return body_target_pose
+
+        offset_body_target_pose = {}
+        for side in ["left", "right"]:
+            wrist_frame = self.full_robot.supplemental_info.hand_frame_names[side]
+            if wrist_frame in body_target_pose:
+                offset_body_target_pose[wrist_frame] = (
+                    body_target_pose[wrist_frame] @ self._wrist_offset_inv
+                )
+
+        # Preserve any other targets that may be present in the dict.
+        for link_name, pose in body_target_pose.items():
+            if link_name not in offset_body_target_pose:
+                offset_body_target_pose[link_name] = pose
+
+        return offset_body_target_pose
+
     def _inverse_kinematics(
         self,
         body_target_pose,
@@ -96,6 +137,7 @@ class TeleopRetargetingIK(Policy):
             Configuration vector that achieves the target poses.
         """
         if body_target_pose:
+            body_target_pose = self._apply_wrist_offset(body_target_pose)
             if self.using_reduced_robot_model:
                 body_q = self.body.reduced_to_full_configuration(
                     self.body_ik_solver(body_target_pose)

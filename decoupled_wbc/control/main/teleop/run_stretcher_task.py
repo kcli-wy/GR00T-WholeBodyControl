@@ -799,21 +799,13 @@ class StretcherTaskController:
 
         self.cmd_publisher.publish(msg)
 
-        # Log published command
-        arm_str = "N/A"
-        if target_upper_body_pose is not None:
-            n = len(target_upper_body_pose)
-            mid = n // 2
-            left = np.rad2deg(target_upper_body_pose[:mid])
-            right = np.rad2deg(target_upper_body_pose[mid:])
-            arm_str = f"L=[{', '.join(f'{v:.1f}' for v in left)}] R=[{', '.join(f'{v:.1f}' for v in right)}]"
+        # Log published command (双臂关节角已删除, IK 目标 position 由 _solve_ik_for_handles 打印)
         # torso_rpy 本身是度，直接打印
         print(
             f"[CMD] phase={self.current_phase_enum.value:12s} "
             f"nav=[{nav_cmd[0]:+.3f}, {nav_cmd[1]:+.3f}, {nav_cmd[2]:+.3f}] "
             f"h={base_height:.3f}m "
-            f"waist_rpy=[{torso_rpy[0]:+.1f}, {torso_rpy[1]:+.1f}, {torso_rpy[2]:+.1f}]deg "
-            f"arms={arm_str}"
+            f"waist_rpy=[{torso_rpy[0]:+.1f}, {torso_rpy[1]:+.1f}, {torso_rpy[2]:+.1f}]deg"
         )
 
     def _publish_status(self, status: str, progress: float = 0.0):
@@ -927,9 +919,12 @@ class StretcherTaskController:
                 left_handle = StretcherHandle(
                     position=np.array(self.context.default_left_wrist_position, dtype=float)
                 )
+                left_src = "default"
             else:
                 print("WARNING: left handle and default position both unavailable")
                 return None
+        else:
+            left_src = "locked" if self.context.handle_locked else "live"
 
         right_handle = self.context.right_handle
         if right_handle is None:
@@ -938,18 +933,31 @@ class StretcherTaskController:
                 right_handle = StretcherHandle(
                     position=np.array(self.context.default_right_wrist_position, dtype=float)
                 )
+                right_src = "default"
             else:
                 print("WARNING: right handle and default position both unavailable")
                 return None
+        else:
+            right_src = "locked" if self.context.handle_locked else "live"
 
         left_wrist = self._compute_wrist_orientation(left_handle, "left")
         right_wrist = self._compute_wrist_orientation(right_handle, "right")
+
+        # debug: 打印本次 IK 求解的目标 position 及来源 (locked=GRABBING/STANDING_UP 锁定值,
+        # live=FineTuning/settle 实时值, default=handle 缺失的 fallback)
+        print(
+            f"[IK-target] left  = [{left_handle.position[0]:+.3f}, "
+            f"{left_handle.position[1]:+.3f}, {left_handle.position[2]:+.3f}]  ({left_src})"
+        )
+        print(
+            f"[IK-target] right = [{right_handle.position[0]:+.3f}, "
+            f"{right_handle.position[1]:+.3f}, {right_handle.position[2]:+.3f}]  ({right_src})"
+        )
 
         body_data = {
             "left_wrist_yaw_link": left_wrist,
             "right_wrist_yaw_link": right_wrist,
         }
-
         self.retargeting_ik.set_goal({
             "body_data": body_data,
             "left_hand_data": {"position": np.zeros((25, 4, 4))},
@@ -1208,18 +1216,18 @@ Valid phases: idle, navigating, fine_tuning, approaching, grabbing, standing_up,
         "--default-left-wrist-position",
         type=float,
         nargs=3,
-        default=[0.25, 0.3, 0.1],
+        default=[0.25, 0.3, 0],
         metavar=("X", "Y", "Z"),
-        help="[Grabbing] 左 handle 缺失时的 fallback position [x y z] (pelvis 系, 米, default: 0.25 0.3 0.1). "
+        help="[Grabbing] 左 handle 缺失时的 fallback position [x y z] (pelvis 系, 米, default: 0.25 0.3 0). "
              "朝向始终走 waist_pitch 补偿, 此处只给 position",
     )
     parser.add_argument(
         "--default-right-wrist-position",
         type=float,
         nargs=3,
-        default=[0.25, -0.3, 0.1],
+        default=[0.25, -0.3, 0],
         metavar=("X", "Y", "Z"),
-        help="[Grabbing] 右 handle 缺失时的 fallback position [x y z] (pelvis 系, 米, default: 0.25 -0.3 0.1). "
+        help="[Grabbing] 右 handle 缺失时的 fallback position [x y z] (pelvis 系, 米, default: 0.25 -0.3 0). "
              "朝向始终走 waist_pitch 补偿, 此处只给 position",
     )
 
