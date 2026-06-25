@@ -23,8 +23,10 @@ from typing import Dict, List
 import numpy as np
 
 from decoupled_wbc.control.main.constants import (
+    DEFAULT_STRETCHER_POSE_TOPIC_PREFIX,
+    STRETCHER_LEFT_HANDLE_ID,
     STRETCHER_NAV_CMD_TOPIC,
-    STRETCHER_POSE_TOPIC,
+    STRETCHER_RIGHT_HANDLE_ID,
     STRETCHER_TASK_STATUS_TOPIC,
 )
 from decoupled_wbc.control.utils.ros_utils import ROSManager, ROSMsgPublisher, ROSMsgSubscriber
@@ -54,12 +56,26 @@ class MockVLNPublisher:
 
 
 class MockPosePublisher:
-    """Mock pose estimation model that publishes handle poses."""
+    """Mock FoundationPose++ publisher.
 
-    def __init__(self):
+    真实 FP++ 对每个物体发独立 topic (FoundationPose/pose/<object_id>), 各自带
+    pose_robot_matrix (4x4). 这里镜像该接口: 两个独立 publisher, 每条消息带
+    pose_robot_matrix, 由调用方传 position 构造 (orientation 置单位阵 —— 真实
+    StretcherHandle.from_msg 只取平移列, 不读朝向).
+    """
+
+    def __init__(self, pose_topic_prefix: str = DEFAULT_STRETCHER_POSE_TOPIC_PREFIX):
         self.ros_manager = ROSManager(node_name="MockPose")
-        self.publisher = ROSMsgPublisher(STRETCHER_POSE_TOPIC)
+        self.left_publisher = ROSMsgPublisher(f"{pose_topic_prefix}/{STRETCHER_LEFT_HANDLE_ID}")
+        self.right_publisher = ROSMsgPublisher(f"{pose_topic_prefix}/{STRETCHER_RIGHT_HANDLE_ID}")
         self.counter = 0
+
+    @staticmethod
+    def _position_to_robot_matrix(position: List[float]) -> list:
+        """把 [x,y,z] 包成 4x4 齐次变换矩阵 (单位旋转 + 平移), 模拟 FP++ 的 pose_robot_matrix."""
+        T = np.eye(4)
+        T[:3, 3] = position
+        return T.tolist()
 
     def publish_test_pose(
         self,
@@ -68,30 +84,31 @@ class MockPosePublisher:
         ready_to_grab: bool = False,
         nav_cmd: List[float] = None,
     ):
-        """Publish a test pose message."""
-        msg = {"timestamp": time.time()}
+        """Publish a test handle pose message (两侧独立 topic).
 
+        ready_to_grab / nav_cmd 仅用于向后兼容调用方签名, 当前 controller 不再读取
+        (FineTuning 改用内置 PD), 这里忽略不发布.
+        """
         if left_position is not None:
-            msg["left_handle"] = {
-                "position": left_position,
-                "orientation": [1.0, 0.0, 0.0, 0.0],
-            }
+            self.left_publisher.publish({
+                "object_id": STRETCHER_LEFT_HANDLE_ID,
+                "frame_id": "head_camera",
+                "stamp": time.time_ns(),
+                "pose_robot_matrix": self._position_to_robot_matrix(left_position),
+                "timestamp": time.time(),
+            })
 
         if right_position is not None:
-            msg["right_handle"] = {
-                "position": right_position,
-                "orientation": [1.0, 0.0, 0.0, 0.0],
-            }
+            self.right_publisher.publish({
+                "object_id": STRETCHER_RIGHT_HANDLE_ID,
+                "frame_id": "head_camera",
+                "stamp": time.time_ns(),
+                "pose_robot_matrix": self._position_to_robot_matrix(right_position),
+                "timestamp": time.time(),
+            })
 
-        if ready_to_grab:
-            msg["ready_to_grab"] = True
-
-        if nav_cmd is not None:
-            msg["navigate_cmd"] = nav_cmd
-
-        self.publisher.publish(msg)
         self.counter += 1
-        print(f"[Pose] Published handles: left={left_position}, right={right_position}, ready={ready_to_grab}")
+        print(f"[Pose] Published handles: left={left_position}, right={right_position}")
 
     def shutdown(self):
         self.ros_manager.shutdown()

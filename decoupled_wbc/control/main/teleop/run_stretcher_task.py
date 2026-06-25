@@ -22,6 +22,7 @@ import subprocess
 import sys
 import time
 from abc import ABC, abstractmethod
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Type
@@ -33,9 +34,11 @@ from decoupled_wbc.control.main.constants import (
     CONTROL_GOAL_TOPIC,
     DEFAULT_BASE_HEIGHT,
     DEFAULT_NAV_CMD,
+    DEFAULT_STRETCHER_POSE_TOPIC_PREFIX,
     STATE_TOPIC_NAME,
+    STRETCHER_LEFT_HANDLE_ID,
     STRETCHER_NAV_CMD_TOPIC,
-    STRETCHER_POSE_TOPIC,
+    STRETCHER_RIGHT_HANDLE_ID,
     STRETCHER_TASK_STATUS_TOPIC,
 )
 from decoupled_wbc.control.robot_model.instantiation.g1 import instantiate_g1_robot_model
@@ -60,16 +63,24 @@ class TaskPhase(Enum):
 
 @dataclass
 class StretcherHandle:
-    """Represents a stretcher handle pose."""
+    """Represents a stretcher handle pose.
+
+    只保留 position (pelvis 系, 米). orientation 故意不存 —— 手腕目标朝向统一由
+    _compute_wrist_orientation 按 waist_pitch 补偿算出 (世界系下 R_y(90°) 垂直向下),
+    不使用 FoundationPose++ 给的朝向估计.
+    """
     position: np.ndarray = field(default_factory=lambda: np.zeros(3))
-    orientation: np.ndarray = field(default_factory=lambda: np.array([1.0, 0.0, 0.0, 0.0]))
 
     @classmethod
     def from_msg(cls, msg: dict) -> "StretcherHandle":
-        return cls(
-            position=np.array(msg.get("position", [0, 0, 0])),
-            orientation=np.array(msg.get("orientation", [1, 0, 0, 0])),
-        )
+        """从 FoundationPose++ 单条消息解析 handle position.
+
+        msg["pose_robot_matrix"] 是 4x4 齐次变换矩阵 (机器人坐标系, 已由
+        camera_to_robot 从相机系转换). position 已落到 IK 求解参考系 (pelvis 系),
+        直接取平移列. 不做防御: 缺字段即认为是真 bug, 由调用方判 None 走 fallback.
+        """
+        pose = np.array(msg["pose_robot_matrix"])
+        return cls(position=pose[:3, 3].copy())
 
 
 @dataclass
@@ -87,6 +98,10 @@ class TaskContext:
     # Handle poses from pose estimation
     left_handle: Optional[StretcherHandle] = None
     right_handle: Optional[StretcherHandle] = None
+    # handle 锁定标志: GRABBING settle 结束后置 True, 之后 _update_handles 不再刷新
+    # context 里的 handle (STANDING_UP 期间就地改 position.z 不受此限制 —— 锁的是
+    # "不从外部 pose 重新读取", 不是 "不许改 position")
+    handle_locked: bool = False
 
     # Target values for grabbing
     target_height: float = 0.34
@@ -168,30 +183,116 @@ class NavigatingPhase(BasePhase):
 
 
 class FineTuningPhase(BasePhase):
-    """Phase 2: 基于位姿估计的微调定位.
+    """Phase 2: 基于 handle 位姿的近场微调 (PD 闭环).
 
-    - 输入: FoundationPose++ → StretcherTask/pose
-    - 输出: navigate_cmd → 底盘微调位置
-    - 副作用: 更新 context.left_handle / right_handle
-    - 跳转条件: 位姿估计发送 ready_to_grab=True
+    - 输入: 两个 FoundationPose++ handle pose topic (持续刷新 context)
+    - 输出: navigate_cmd → 底盘 PD 微调
+    - 闭环: 用左右 handle 均值算 x/y 误差, 用左右 handle x 差算 θ 误差,
+            PD (P + D) 输出 [vx, vy, vθ], 各维限幅.
+            D 项对 EWMA 低通后的误差求差分, 抑制 pose 抖动放大.
+    - 跳转条件: 误差连续 N 帧 < tol → APPROACHING
+    - 不再订阅 navigate_cmd / ready_to_grab (旧 VLN/Pose 桥接的字段, 已剥离).
+
+    目标抓取窗 (pelvis 系, 硬编码):
+      - x = target_handle_x  (CLI, 默认 0.45m, 实机调)
+      - y = 0                (左右 handle y 均值对到机器人中线)
+      - z 不在本阶段管       (交给后续 APPROACHING 弯腰)
     """
+
+    def __init__(
+        self,
+        context: TaskContext,
+        controller: "StretcherTaskController",
+        target_handle_x: float = 0.45,
+        kp_x: float = 1.0,
+        kp_y: float = 1.0,
+        kp_theta: float = 1.0,
+        kd_x: float = 0.0,
+        kd_y: float = 0.0,
+        kd_theta: float = 0.0,
+        d_alpha: float = 0.5,
+        max_nav_speed: List[float] = None,
+        tol: float = 0.03,
+        tol_theta: float = 0.05,
+        converge_frames: int = 10,
+    ):
+        super().__init__(context, controller)
+        self.target_handle_x = target_handle_x
+        self.kp = np.array([kp_x, kp_y, kp_theta], dtype=float)
+        self.kd = np.array([kd_x, kd_y, kd_theta], dtype=float)
+        self.d_alpha = d_alpha  # EWMA 低通系数: filt = alpha*filt + (1-alpha)*err
+        self.max_nav_speed = np.array(max_nav_speed if max_nav_speed else [0.1, 0.1, 0.1], dtype=float)
+        self.tol = tol
+        self.tol_theta = tol_theta
+        self.converge_frames = converge_frames
+        # 运行态: 在 enter() 重置
+        self._filt_err = np.zeros(3)
+        self._last_update_time = 0.0
+        self._converge_count = 0
+
+    def enter(self):
+        super().enter()
+        self._filt_err = np.zeros(3)
+        self._last_update_time = time.monotonic()
+        self._converge_count = 0
+
+    def _compute_error(self) -> np.ndarray:
+        """计算 [err_x, err_y, err_theta].
+
+        err_x = target_x - mean_x       (mean_x = (x_left + x_right)/2)
+        err_y = -mean_y                 (mean_y = (y_left + y_right)/2, 对到中线)
+        err_theta = x_right - x_left    (担架偏航: 正对时 ~0; 符号方向实机翻 Kp_theta)
+        """
+        lx, ly, _ = self.context.left_handle.position
+        rx, ry, _ = self.context.right_handle.position
+        mean_x = (lx + rx) / 2.0
+        mean_y = (ly + ry) / 2.0
+        return np.array([
+            self.target_handle_x - mean_x,
+            -mean_y,
+            rx - lx,
+        ])
 
     def update(self) -> Optional[TaskPhase]:
         self.controller._publish_status(f"Fine-tuning position... ({self.elapsed:.1f}s)")
 
-        # 更新 handle pose (存储到 context 供后续 IK 使用)
+        # 刷新最新 handle (FineTuning 用单帧最新值做实时反馈, 锁定用 buffer 是 GRABBING 的事)
         self.controller._update_handles()
 
-        # 从位姿估计读取微调导航指令
-        pose_msg = self.controller.pose_subscriber.get_msg()
-        if pose_msg and "navigate_cmd" in pose_msg:
-            self.context.nav_cmd = np.array(pose_msg["navigate_cmd"])
-            self.controller._publish_command(nav_cmd=self.context.nav_cmd)
+        # 任一侧还没收到 pose → 停车等待, 不解算
+        if self.context.left_handle is None or self.context.right_handle is None:
+            self.controller._publish_command(nav_cmd=np.array([0.0, 0.0, 0.0]))
+            return None
 
-        # 位姿估计报告就绪
-        if pose_msg and pose_msg.get("ready_to_grab", False):
-            print("Pose estimation reports ready to grab")
-            return TaskPhase.APPROACHING
+        err = self._compute_error()
+
+        # D 项: 对误差做 EWMA 低通后再求差分, 避免把 pose 抖动直接放大进 nav_cmd
+        prev_filt_err = self._filt_err.copy()
+        self._filt_err = self.d_alpha * self._filt_err + (1.0 - self.d_alpha) * err
+        t_now = time.monotonic()
+        dt = t_now - self._last_update_time
+        if dt <= 0.0:
+            dt = 1e-3  # 防除零 (同 tick 或时钟回退)
+        d_err = (self._filt_err - prev_filt_err) / dt
+        self._last_update_time = t_now
+
+        nav_cmd = self.kp * err + self.kd * d_err
+        # 各维独立限幅
+        nav_cmd = np.clip(nav_cmd, -self.max_nav_speed, self.max_nav_speed)
+
+        self.controller._publish_command(nav_cmd=nav_cmd)
+
+        # 收敛判定: 三维误差同时小于阈值, 连续 N 帧才退出 (防 pose 抖动假退出)
+        converged = (abs(err[0]) < self.tol
+                     and abs(err[1]) < self.tol
+                     and abs(err[2]) < self.tol_theta)
+        if converged:
+            self._converge_count += 1
+            if self._converge_count >= self.converge_frames:
+                print(f"Fine-tuning converged: err={err}, holding for APPROACHING")
+                return TaskPhase.APPROACHING
+        else:
+            self._converge_count = 0
 
         return None
 
@@ -250,17 +351,23 @@ class ApproachingPhase(BasePhase):
 
 
 class GrabbingPhase(BasePhase):
-    """Phase 3b: IK 求解 + 抓取担架把手.
+    """Phase 3b: 锁定 handle + IK 求解 + 抓取担架把手.
 
-    - 输入: FoundationPose++ → handle pose (持续更新)
-    - IK 求解: handle pose → 4x4 wrist 矩阵 → TeleopRetargetingIK → 关节角
-    - 输出: target_upper_body_pose (双臂关节角) + base_height + torso_rpy
-    - 副作用: 50% 进度时启动外部抓取脚本
-    - 跳转条件: 时间到 (默认 3s)
+    分两段 (非阻塞, 不卡主循环):
 
-    与 APPROACHING 不同，本阶段直接得到 IK 目标关节角 (无中间状态)，
-    因此需要通过 target_time 指定运动持续时间，让 InterpolationPolicy
-    生成平滑轨迹。target_time = 当前时间 + move_duration。
+    1) settle 段 (enter 后 lock_settle_time 秒):
+       - 持续 _update_handles() 把最新 handle push 进锁定 buffer (此时 handle_locked=False,
+         _update_handles 正常刷新 context)
+       - 不发任何 command —— 机器人靠 InterpolationPolicy 对超出 target_time 的查询做
+         夹断 (返回终点姿态), 维持 APPROACHING 末态的弯腰姿态不松
+       - 到点 _lock_handles(): 对 buffer 最近 N 帧取均值写 context, 置 handle_locked=True
+    2) 正常抓取段 (settle 后 duration 秒):
+       - handle_locked=True, _update_handles 不再刷新 (锁定值不变)
+       - _solve_ik_for_handles() 用锁定 handle 解 IK
+       - 发 target_upper_body_pose + 维持 base_height/torso_rpy, 50% 触发 grab_script
+       - 跳转条件: progress>=1.0 → STANDING_UP
+
+    progress 从锁定时刻起算 (不把 settle 算进抓取时间).
     """
 
     def __init__(
@@ -270,22 +377,54 @@ class GrabbingPhase(BasePhase):
         duration: float = 3.0,
         move_duration: float = 0.5,
         grab_script: str = None,
+        lock_settle_time: float = 1.5,
+        lock_window: int = 10,
     ):
         super().__init__(context, controller)
         self.duration = duration
         self.move_duration = move_duration  # IK 目标运动的持续时间 (秒)
         self.grab_script = grab_script
+        self.lock_settle_time = lock_settle_time
+        self.lock_window = lock_window
         self._grab_script_triggered = False
+        # settle 倒计时剩余 (秒); >0 表示还在 settle 段
+        self._lock_remaining = lock_settle_time
+        # 正常抓取段起始时刻 (锁定完成时设置)
+        self._grab_start_time = 0.0
+        # settle 倒计时用实测 dt (受系统负载影响, 不假设 50Hz)
+        self._last_update_time = 0.0
 
     def enter(self):
         super().enter()
         self._grab_script_triggered = False
+        self._lock_remaining = self.lock_settle_time
+        self._last_update_time = time.monotonic()
+        # 清空锁定 buffer, settle 期间全新采集 (APPROACHING 不刷 handle, 无残留)
+        self.controller._left_handle_buffer.clear()
+        self.controller._right_handle_buffer.clear()
 
     def update(self) -> Optional[TaskPhase]:
-        progress = self.elapsed / self.duration
+        # ---- settle 段: 采 handle, 不发 command ----
+        if self._lock_remaining > 0.0:
+            self.controller._publish_status(
+                f"Grabbing: settling pose ({self.lock_settle_time - self._lock_remaining:.1f}/{self.lock_settle_time}s)",
+            )
+            self.controller._update_handles()  # 采最新 handle 进 buffer + context
+            t_now = time.monotonic()
+            self._lock_remaining -= (t_now - self._last_update_time)
+            self._last_update_time = t_now
+            if self._lock_remaining <= 0.0:
+                self._lock_remaining = 0.0
+                self.controller._lock_handles()
+                self._grab_start_time = time.monotonic()
+            return None
+
+        # ---- 正常抓取段 ----
+        grab_elapsed = time.monotonic() - self._grab_start_time
+        progress = grab_elapsed / self.duration
 
         self.controller._publish_status(
-            f"Grabbing stretcher... ({self.elapsed:.1f}s)",
+            f"Grabbing stretcher... ({grab_elapsed:.1f}s)",
             progress=min(progress, 1.0),
         )
 
@@ -293,10 +432,7 @@ class GrabbingPhase(BasePhase):
             print("Grab phase complete")
             return TaskPhase.STANDING_UP
 
-        # 持续更新 handle pose
-        self.controller._update_handles()
-
-        # IK 求解: 得到双臂关节角
+        # handle 已锁定, _update_handles 直接 return (不刷新); 直接解 IK
         upper_body_pose = self.controller._solve_ik_for_handles()
 
         if upper_body_pose is not None:
@@ -340,8 +476,9 @@ class StandingUpPhase(BasePhase):
             保证手腕在世界系下始终垂直向下, 担架被水平抬起.
     - 跳转条件: 时间到 (默认 3s)
 
-    注: 站起期间相机看不到 handle, STRETCHER_POSE_TOPIC 不再发布, 所以本阶段
-    直接就地覆写 context.{left,right}_handle.position[2], 不依赖外部位姿估计.
+    注: 站起期间相机看不到 handle, FoundationPose++ 不再发布 handle pose,
+    所以本阶段直接就地覆写 context.{left,right}_handle.position[2], 不依赖外部位姿估计.
+    此时 handle 已在 GRABBING settle 末锁定 (context.handle_locked=True), 就地改 z 不受锁定影响.
     """
 
     def __init__(
@@ -440,6 +577,10 @@ class StretcherTaskController:
         target_torso_rpy: List[float] = [0.0, 60.0, 0.0],
         default_left_wrist_position: List[float] = None,
         default_right_wrist_position: List[float] = None,
+        pose_topic_prefix: str = DEFAULT_STRETCHER_POSE_TOPIC_PREFIX,
+        # GRABBING 阶段: settle 时长 + 锁定窗口
+        grab_lock_settle_time: float = 1.5,
+        grab_lock_window: int = 10,
         grab_duration: float = 3.0,
         move_duration: float = 0.5,
         approach_duration: float = 2.0,
@@ -448,9 +589,38 @@ class StretcherTaskController:
         publish_frequency: float = 50.0,
         grab_script: str = None,
         single_phase: bool = False,
+        # FINE_TUNING 阶段 PD 控制器参数 (实机调默认占位值)
+        finetune_target_handle_x: float = 0.45,
+        finetune_kp_x: float = 1.0,
+        finetune_kp_y: float = 1.0,
+        finetune_kp_theta: float = 1.0,
+        finetune_kd_x: float = 0.0,
+        finetune_kd_y: float = 0.0,
+        finetune_kd_theta: float = 0.0,
+        finetune_d_alpha: float = 0.5,
+        finetune_max_nav_speed: List[float] = None,
+        finetune_tol: float = 0.03,
+        finetune_tol_theta: float = 0.05,
+        finetune_converge_frames: int = 10,
     ):
         self.publish_frequency = publish_frequency
         self.single_phase = single_phase
+        # GRABBING settle 期间采 handle 的窗口大小 (传给 GrabbingPhase)
+        self.grab_lock_settle_time = grab_lock_settle_time
+        self.grab_lock_window = grab_lock_window
+        # FINE_TUNING PD 参数
+        self.finetune_target_handle_x = finetune_target_handle_x
+        self.finetune_kp_x = finetune_kp_x
+        self.finetune_kp_y = finetune_kp_y
+        self.finetune_kp_theta = finetune_kp_theta
+        self.finetune_kd_x = finetune_kd_x
+        self.finetune_kd_y = finetune_kd_y
+        self.finetune_kd_theta = finetune_kd_theta
+        self.finetune_d_alpha = finetune_d_alpha
+        self.finetune_max_nav_speed = finetune_max_nav_speed
+        self.finetune_tol = finetune_tol
+        self.finetune_tol_theta = finetune_tol_theta
+        self.finetune_converge_frames = finetune_converge_frames
 
         # Task context (shared state)
         self.context = TaskContext(
@@ -469,10 +639,18 @@ class StretcherTaskController:
         self.status_publisher = ROSMsgPublisher(STRETCHER_TASK_STATUS_TOPIC)
 
         # Subscribers
+        # VLN 导航指令 (NAVIGATING 阶段用, FineTuning 起改用内置 PID, 不再读它)
         self.nav_cmd_subscriber = ROSMsgSubscriber(STRETCHER_NAV_CMD_TOPIC)
-        self.pose_subscriber = ROSMsgSubscriber(STRETCHER_POSE_TOPIC)
         # 机器人状态订阅 (50Hz): 用于读取实测 waist_pitch 做 IK 目标朝向补偿
         self.state_subscriber = ROSMsgSubscriber(STATE_TOPIC_NAME)
+        # 两个独立的 FoundationPose++ handle pose topic (各自一物体一 topic, 不同步).
+        # 真实 topic 名 = f"{prefix}/{object_id}", 多机时通过 --pose-topic-namespace 覆盖 prefix.
+        self.left_pose_subscriber = ROSMsgSubscriber(f"{pose_topic_prefix}/{STRETCHER_LEFT_HANDLE_ID}")
+        self.right_pose_subscriber = ROSMsgSubscriber(f"{pose_topic_prefix}/{STRETCHER_RIGHT_HANDLE_ID}")
+        # GRABBING settle 期间累积最近若干帧 handle position, 锁定时取均值平滑 pose 抖动.
+        # maxlen 在 GrabbingPhase.enter() 里按 grab_lock_window 重新设置.
+        self._left_handle_buffer: deque = deque(maxlen=grab_lock_window)
+        self._right_handle_buffer: deque = deque(maxlen=grab_lock_window)
 
         # Initialize robot model for IK
         self.robot_model = instantiate_g1_robot_model(
@@ -502,9 +680,32 @@ class StretcherTaskController:
         self.phases: Dict[TaskPhase, BasePhase] = {
             TaskPhase.IDLE: IdlePhase(self.context, self),
             TaskPhase.NAVIGATING: NavigatingPhase(self.context, self),
-            TaskPhase.FINE_TUNING: FineTuningPhase(self.context, self),
+            TaskPhase.FINE_TUNING: FineTuningPhase(
+                self.context,
+                self,
+                target_handle_x=self.finetune_target_handle_x,
+                kp_x=self.finetune_kp_x,
+                kp_y=self.finetune_kp_y,
+                kp_theta=self.finetune_kp_theta,
+                kd_x=self.finetune_kd_x,
+                kd_y=self.finetune_kd_y,
+                kd_theta=self.finetune_kd_theta,
+                d_alpha=self.finetune_d_alpha,
+                max_nav_speed=self.finetune_max_nav_speed,
+                tol=self.finetune_tol,
+                tol_theta=self.finetune_tol_theta,
+                converge_frames=self.finetune_converge_frames,
+            ),
             TaskPhase.APPROACHING: ApproachingPhase(self.context, self, approach_duration),
-            TaskPhase.GRABBING: GrabbingPhase(self.context, self, grab_duration, move_duration, grab_script),
+            TaskPhase.GRABBING: GrabbingPhase(
+                self.context,
+                self,
+                duration=grab_duration,
+                move_duration=move_duration,
+                grab_script=grab_script,
+                lock_settle_time=self.grab_lock_settle_time,
+                lock_window=self.grab_lock_window,
+            ),
             TaskPhase.STANDING_UP: StandingUpPhase(
                 self.context,
                 self,
@@ -626,13 +827,50 @@ class StretcherTaskController:
         self.status_publisher.publish(msg)
 
     def _update_handles(self):
-        """Update stretcher handle poses from subscriber."""
-        pose_msg = self.pose_subscriber.get_msg()
-        if pose_msg:
-            if "left_handle" in pose_msg:
-                self.context.left_handle = StretcherHandle.from_msg(pose_msg["left_handle"])
-            if "right_handle" in pose_msg:
-                self.context.right_handle = StretcherHandle.from_msg(pose_msg["right_handle"])
+        """从两个独立 FoundationPose++ topic 各自读取最新 handle pose.
+
+        左右独立刷新: 某侧这一 tick 没有新消息 (get_msg 返回 None) 就保持上次的值,
+        不会因一侧没更新而卡住另一侧 (担架静止, 几毫秒错位可忽略).
+        新消息进来时同时 push 进锁定 buffer (GRABBING settle 期间用).
+
+        handle 锁定后 (context.handle_locked=True) 直接 return —— GRABBING settle
+        结束已用均值锁定 handle, STANDING_UP 期间就地改 position.z 不受此限制
+        (本函数锁的是 "不从外部 pose 重新读取", 不是 "不许改 position").
+        """
+        if self.context.handle_locked:
+            return
+        for side in ("left", "right"):
+            sub = getattr(self, f"{side}_pose_subscriber")
+            buf = getattr(self, f"_{side}_handle_buffer")
+            msg = sub.get_msg()
+            if msg is None:
+                continue
+            handle = StretcherHandle.from_msg(msg)
+            setattr(self.context, f"{side}_handle", handle)
+            buf.append(handle.position)
+
+    def _lock_handles(self):
+        """对最近若干帧 handle position 取均值, 锁定到 context 并禁止后续刷新.
+
+        GRABBING settle 结束时调用: 此时机器人已停下, 对 settle 期间累积的
+        最近 N 帧取均值, 平滑掉 pose 估计的高频抖动, 之后整段 GRABBING/STANDING_UP
+        都用这一组锁定值求解 IK. buffer 空时打印警告并放弃锁定 (后续仍可 fallback).
+        """
+        if len(self._left_handle_buffer) == 0 or len(self._right_handle_buffer) == 0:
+            print("WARNING: cannot lock handles, lock buffer empty (FP++ not publishing?)")
+            return
+        self.context.left_handle = StretcherHandle(
+            position=np.mean(self._left_handle_buffer, axis=0)
+        )
+        self.context.right_handle = StretcherHandle(
+            position=np.mean(self._right_handle_buffer, axis=0)
+        )
+        self.context.handle_locked = True
+        print(
+            f"[LOCK] handles locked — "
+            f"L={self.context.left_handle.position} "
+            f"R={self.context.right_handle.position}"
+        )
 
     def _update_robot_state(self):
         """从 G1Env/env_state_act 读取最新 q, 更新 context.current_waist_pitch.
@@ -711,9 +949,7 @@ class StretcherTaskController:
             "left_wrist_yaw_link": left_wrist,
             "right_wrist_yaw_link": right_wrist,
         }
-        print("========================================")
-        print(body_data)
-        print("========================================")
+
         self.retargeting_ik.set_goal({
             "body_data": body_data,
             "left_hand_data": {"position": np.zeros((25, 4, 4))},
@@ -767,7 +1003,11 @@ class StretcherTaskController:
 
 
 def parse_args():
-    """Parse command line arguments."""
+    """Parse command line arguments.
+
+    参数按阶段 (stage) 分组、按阶段顺序排列 (Global → NAVIGATING → FINE_TUNING
+    → APPROACHING → GRABBING → STANDING_UP). 每个参数 help 里也标了所属阶段.
+    """
     parser = argparse.ArgumentParser(
         description="Stretcher task controller for G1 robot",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -789,22 +1029,138 @@ Valid phases: idle, navigating, fine_tuning, approaching, grabbing, standing_up,
         """,
     )
 
+    # ==================== Global / Runtime (跨阶段, 控制循环本身) ====================
     parser.add_argument(
         "--start-phase",
         type=str,
         default="idle",
-        help="Phase to start from (default: idle)",
+        help="[Global] Phase to start from (default: idle)",
     )
     parser.add_argument(
         "--auto-start",
         action="store_true",
-        help="Automatically start the task (transition from idle to navigating)",
+        help="[Global] Automatically start the task (transition from idle to navigating)",
+    )
+    parser.add_argument(
+        "--single-phase",
+        action="store_true",
+        help="[Global] Run only the specified --start-phase, stop when it completes instead of transitioning",
+    )
+    parser.add_argument(
+        "--freq",
+        type=float,
+        default=50.0,
+        help="[Global] Publishing frequency in Hz (default: 50.0)",
+    )
+    parser.add_argument(
+        "--duration",
+        type=float,
+        default=None,
+        help="[Global] Maximum task duration in seconds (None for indefinite)",
+    )
+    parser.add_argument(
+        "--pose-topic-namespace",
+        type=str,
+        default=DEFAULT_STRETCHER_POSE_TOPIC_PREFIX,
+        help="[Global] FoundationPose++ handle pose topic 前缀 (多机区分用). "
+             "真实 topic = f'{prefix}/{left,right}_handle' (default: FoundationPose/pose)",
+    )
+
+    # ==================== NAVIGATING (Phase 1: VLN 远场导航) ====================
+    # NAVIGATING 只订阅 StretcherTask/nav_cmd (VLN 发), 无本阶段专有参数.
+
+    # ==================== FINE_TUNING (Phase 2: handle 位姿 PD 微调) ====================
+    parser.add_argument(
+        "--finetune-target-handle-x",
+        type=float,
+        default=0.45,
+        help="[FineTuning] 目标抓取窗 x (pelvis 系, 米), 两 handle 均值收敛到此. "
+             "默认 0.45, 实机调. (y 固定收敛到 0, z 不在本阶段管)",
+    )
+    parser.add_argument(
+        "--finetune-kp-x",
+        type=float,
+        default=1.0,
+        help="[FineTuning] x 方向 P 增益 (default: 1.0, 实机调)",
+    )
+    parser.add_argument(
+        "--finetune-kp-y",
+        type=float,
+        default=1.0,
+        help="[FineTuning] y 方向 P 增益 (default: 1.0, 实机调)",
+    )
+    parser.add_argument(
+        "--finetune-kp-theta",
+        type=float,
+        default=1.0,
+        help="[FineTuning] 偏航 θ 方向 P 增益 (default: 1.0, 实机调). "
+             "符号方向实机验证: 故意歪担架看 PID 输出对不对, 不对翻此参数符号",
+    )
+    parser.add_argument(
+        "--finetune-kd-x",
+        type=float,
+        default=0.0,
+        help="[FineTuning] x 方向 D 增益 (default: 0.0, 实机调). "
+             "D 项对 EWMA 低通后的误差求差分, 抑制 pose 抖动放大",
+    )
+    parser.add_argument(
+        "--finetune-kd-y",
+        type=float,
+        default=0.0,
+        help="[FineTuning] y 方向 D 增益 (default: 0.0, 实机调)",
+    )
+    parser.add_argument(
+        "--finetune-kd-theta",
+        type=float,
+        default=0.0,
+        help="[FineTuning] 偏航 θ 方向 D 增益 (default: 0.0, 实机调)",
+    )
+    parser.add_argument(
+        "--finetune-d-alpha",
+        type=float,
+        default=0.5,
+        help="[FineTuning] D 项误差 EWMA 低通系数 (0~1, default: 0.5). "
+             "越小越平滑但越滞后; 仅当对应 D 增益>0 时生效",
+    )
+    parser.add_argument(
+        "--finetune-max-nav-speed",
+        type=float,
+        nargs=3,
+        default=[0.1, 0.1, 0.1],
+        metavar=("VX", "VY", "VTHETA"),
+        help="[FineTuning] 输出 nav_cmd [vx vy vtheta] 各维限幅 (m/s, rad/s, default: 0.1 0.1 0.1)",
+    )
+    parser.add_argument(
+        "--finetune-tol",
+        type=float,
+        default=0.03,
+        help="[FineTuning] x/y 收敛阈值 (米, default: 0.03)",
+    )
+    parser.add_argument(
+        "--finetune-tol-theta",
+        type=float,
+        default=0.05,
+        help="[FineTuning] θ 收敛阈值 (用左右 handle x 差, 米, default: 0.05, 约 3°)",
+    )
+    parser.add_argument(
+        "--finetune-converge-frames",
+        type=int,
+        default=10,
+        help="[FineTuning] 误差连续低于阈值多少帧才退出 (default: 10, @50Hz≈0.2s, 防 pose 抖动假退出)",
+    )
+
+    # ==================== APPROACHING (Phase 3a: 下蹲 + 弯腰) ====================
+    parser.add_argument(
+        "--approach-duration",
+        type=float,
+        default=2.0,
+        help="[Approaching] 下蹲+弯腰插值时长 (秒, default: 2.0)",
     )
     parser.add_argument(
         "--target-height",
         type=float,
         default=0.34,
-        help="Target base height for grabbing in meters (default: 0.34)",
+        help="[Approaching] 弯腰下蹲目标 base_height (米, default: 0.34), GRABBING/STANDING_UP 维持此值",
     )
     parser.add_argument(
         "--target-torso-rpy",
@@ -812,66 +1168,50 @@ Valid phases: idle, navigating, fine_tuning, approaching, grabbing, standing_up,
         nargs=3,
         default=[0.0, 60.0, 0.0],
         metavar=("ROLL", "PITCH", "YAW"),
-        help="Target torso [roll, pitch, yaw] in degrees (default: 0 60 0)",
+        help="[Approaching] 目标 torso [roll, pitch, yaw] (度, default: 0 60 0)",
+    )
+
+    # ==================== GRABBING (Phase 3b: 锁定 handle + IK 抓取) ====================
+    parser.add_argument(
+        "--grab-lock-settle-time",
+        type=float,
+        default=1.5,
+        help="[Grabbing] 进入 GRABBING 后等待 pose 稳定的 settle 时长 (秒, default: 1.5). "
+             "期间订阅照常但发 command, 到点对最近 N 帧取均值锁定 handle",
+    )
+    parser.add_argument(
+        "--grab-lock-window",
+        type=int,
+        default=10,
+        help="[Grabbing] 锁定时取均值的最近帧数 (default: 10, @50Hz≈0.2s)",
     )
     parser.add_argument(
         "--grab-duration",
         type=float,
         default=3.0,
-        help="Duration for grab phase in seconds (default: 3.0)",
+        help="[Grabbing] settle 结束后 IK 抓取时长 (秒, default: 3.0, 不含 settle)",
     )
     parser.add_argument(
         "--move-duration",
         type=float,
         default=0.5,
-        help="Duration for IK target motion in grab phase (seconds, default: 0.5). "
-             "Controls how fast the arms move to the IK target position.",
-    )
-    parser.add_argument(
-        "--approach-duration",
-        type=float,
-        default=2.0,
-        help="Duration for approach phase in seconds (default: 2.0)",
-    )
-    parser.add_argument(
-        "--standup-duration",
-        type=float,
-        default=3.0,
-        help="Duration for stand-up phase in seconds (default: 3.0)",
-    )
-    parser.add_argument(
-        "--standup-handle-z-target",
-        type=float,
-        default=0.0,
-        help="Stand-up 阶段手腕在 pelvis 系下 z 的最终目标 (米, 左右共用). "
-             "GRABBING 末尾的 z 会沿直线插值到该值, xy 冻结. 默认 0.0",
-    )
-    parser.add_argument(
-        "--freq",
-        type=float,
-        default=50.0,
-        help="Publishing frequency in Hz (default: 50.0)",
+        help="[Grabbing] IK 目标运动持续时间 (秒, default: 0.5), 控制 InterpolationPolicy 平滑过渡",
     )
     parser.add_argument(
         "--grab-script",
         type=str,
         default=None,
-        help="Path to grab script to run via subprocess",
+        help="[Grabbing] 抓取脚本路径, GRABBING 50% 进度时 subprocess 启动",
     )
-    parser.add_argument(
-        "--duration",
-        type=float,
-        default=None,
-        help="Maximum task duration in seconds (None for indefinite)",
-    )
+    # handle 缺失时的 IK fallback position (左右独立)
     parser.add_argument(
         "--default-left-wrist-position",
         type=float,
         nargs=3,
         default=[0.25, 0.3, 0.1],
         metavar=("X", "Y", "Z"),
-        help="Default left wrist position [x y z] (m, pelvis frame) for IK when left handle is unavailable; "
-             "orientation is always waist_pitch-compensated, this only supplies position",
+        help="[Grabbing] 左 handle 缺失时的 fallback position [x y z] (pelvis 系, 米, default: 0.25 0.3 0.1). "
+             "朝向始终走 waist_pitch 补偿, 此处只给 position",
     )
     parser.add_argument(
         "--default-right-wrist-position",
@@ -879,13 +1219,23 @@ Valid phases: idle, navigating, fine_tuning, approaching, grabbing, standing_up,
         nargs=3,
         default=[0.25, -0.3, 0.1],
         metavar=("X", "Y", "Z"),
-        help="Default right wrist position [x y z] (m, pelvis frame) for IK when right handle is unavailable; "
-             "orientation is always waist_pitch-compensated, this only supplies position",
+        help="[Grabbing] 右 handle 缺失时的 fallback position [x y z] (pelvis 系, 米, default: 0.25 -0.3 0.1). "
+             "朝向始终走 waist_pitch 补偿, 此处只给 position",
+    )
+
+    # ==================== STANDING_UP (Phase 4: 抬起担架) ====================
+    parser.add_argument(
+        "--standup-duration",
+        type=float,
+        default=3.0,
+        help="[StandingUp] 站起反向插值时长 (秒, default: 3.0)",
     )
     parser.add_argument(
-        "--single-phase",
-        action="store_true",
-        help="Run only the specified --start-phase, stop when it completes instead of transitioning",
+        "--standup-handle-z-target",
+        type=float,
+        default=0.0,
+        help="[StandingUp] pelvis 系下手腕 z 的最终目标 (米, 左右共用, default: 0.0). "
+             "GRABBING 末尾的 z 沿直线插值到该值, xy 冻结",
     )
 
     return parser.parse_args()
@@ -901,6 +1251,9 @@ def main():
         target_torso_rpy=args.target_torso_rpy,
         default_left_wrist_position=args.default_left_wrist_position,
         default_right_wrist_position=args.default_right_wrist_position,
+        pose_topic_prefix=args.pose_topic_namespace,
+        grab_lock_settle_time=args.grab_lock_settle_time,
+        grab_lock_window=args.grab_lock_window,
         grab_duration=args.grab_duration,
         move_duration=args.move_duration,
         approach_duration=args.approach_duration,
@@ -909,6 +1262,19 @@ def main():
         publish_frequency=args.freq,
         grab_script=args.grab_script,
         single_phase=args.single_phase,
+        # FINE_TUNING PD 参数
+        finetune_target_handle_x=args.finetune_target_handle_x,
+        finetune_kp_x=args.finetune_kp_x,
+        finetune_kp_y=args.finetune_kp_y,
+        finetune_kp_theta=args.finetune_kp_theta,
+        finetune_kd_x=args.finetune_kd_x,
+        finetune_kd_y=args.finetune_kd_y,
+        finetune_kd_theta=args.finetune_kd_theta,
+        finetune_d_alpha=args.finetune_d_alpha,
+        finetune_max_nav_speed=args.finetune_max_nav_speed,
+        finetune_tol=args.finetune_tol,
+        finetune_tol_theta=args.finetune_tol_theta,
+        finetune_converge_frames=args.finetune_converge_frames,
     )
 
     try:

@@ -10,8 +10,14 @@ JOINT_SAFETY_STATUS_TOPIC = "ControlPolicy/joint_safety_status"
 
 # Stretcher task topics
 STRETCHER_NAV_CMD_TOPIC = "StretcherTask/nav_cmd"  # VLN navigation command
-STRETCHER_POSE_TOPIC = "StretcherTask/pose"  # Pose estimation output
 STRETCHER_TASK_STATUS_TOPIC = "StretcherTask/status"  # Task status feedback
+
+# Stretcher handle pose topics (FoundationPose++ 原始输出, 每个物体一个独立 topic)
+# 真实 topic 名 = f"{DEFAULT_STRETCHER_POSE_TOPIC_PREFIX}/{object_id}", 多机时通过
+# --pose-topic-namespace 覆盖 prefix.
+DEFAULT_STRETCHER_POSE_TOPIC_PREFIX = "FoundationPose/pose"
+STRETCHER_LEFT_HANDLE_ID = "left_handle"
+STRETCHER_RIGHT_HANDLE_ID = "right_handle"
 
 # Camera topics
 CAMERA_CHEST_TOPIC = "camera/chest"  # Chest camera for navigation (RGB only)

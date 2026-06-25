@@ -74,11 +74,11 @@ State machine-based controller that orchestrates the entire task.
 
 **Phases:**
 - `IDLE`: Waiting for start command
-- `NAVIGATING`: Phase 1 - VLN navigation to stretcher
-- `FINE_TUNING`: Phase 2 - Pose-based position adjustment
-- `APPROACHING`: Phase 3a - Lower body and adjust torso
-- `GRABBING`: Phase 3b - IK solve and grab handles
-- `STANDING_UP`: Phase 4 - Stand up with stretcher
+- `NAVIGATING`: Phase 1 - VLN 远场导航到担架附近 (订阅 `StretcherTask/nav_cmd`)
+- `FINE_TUNING`: Phase 2 - 基于 handle 位姿的近场 PD 微调 (订阅两个 FoundationPose++ topic, 自算 `nav_cmd`, 收敛后转下一阶段)
+- `APPROACHING`: Phase 3a - 下蹲 + 弯腰 (同步插值 `base_height` / `torso_rpy`)
+- `GRABBING`: Phase 3b - settle 等位姿稳定 → 对最近 N 帧取均值锁定 handle → IK 求解抓取
+- `STANDING_UP`: Phase 4 - 抬起担架 (反向插值, 双手保持抓握, handle z 线性插值上升)
 - `COMPLETED`: Task finished
 
 **Usage:**
@@ -124,13 +124,18 @@ python test_stretcher_comm.py --test full
 |-------|------|-----------|------------|
 | `camera/chest` | ByteMultiArray (msgpack) | Camera Publisher | VLN Model |
 | `camera/head` | ByteMultiArray (msgpack) | Camera Publisher | FoundationPose++ |
-| `FoundationPose/pose/<id>` | ByteMultiArray (msgpack) | FoundationPose++ | Pose Bridge |
-| `StretcherTask/nav_cmd` | ByteMultiArray (msgpack) | VLN Model | Task Controller |
-| `StretcherTask/pose` | ByteMultiArray (msgpack) | Pose Bridge | Task Controller |
+| `FoundationPose/pose/left_handle` | ByteMultiArray (msgpack) | FoundationPose++ | Task Controller |
+| `FoundationPose/pose/right_handle` | ByteMultiArray (msgpack) | FoundationPose++ | Task Controller |
+| `StretcherTask/nav_cmd` | ByteMultiArray (msgpack) | VLN Model | Task Controller (NAVIGATING) |
+| `G1Env/env_state_act` | ByteMultiArray (msgpack) | Robot Control Loop | Task Controller (读 waist_pitch) |
 | `StretcherTask/status` | ByteMultiArray (msgpack) | Task Controller | External |
 | `ControlPolicy/upper_body_pose` | ByteMultiArray (msgpack) | Task Controller | Robot Control Loop |
 
 > 所有 topic 均使用 `ROSMsgPublisher` / `ROSMsgSubscriber` 格式 (ByteMultiArray + msgpack)。
+>
+> **handle pose topic 前缀可配**: 默认 `FoundationPose/pose`, 多机区分时用
+> `--pose-topic-namespace <prefix>` 覆盖 (真实 topic = `f"{prefix}/{left,right}_handle"`)。
+> 不再有 `StretcherTask/pose` 聚合 topic, controller 直接订阅两个独立 FP++ topic。
 
 ### 启动流程
 
@@ -139,14 +144,16 @@ python test_stretcher_comm.py --test full
 python run_realsense_publisher.py --camera head
 
 # 2. 启动 FoundationPose++ (conda activate foundationpose)
-python /path/to/FoundationPose-plus-plus/src/run_foundationpose_ros2.py \
+#    发两个独立 topic: FoundationPose/pose/{left,right}_handle
+python /path/to/FoundationPose-plus-plus/src/obj_pose_track_ros2.py \
     --objects_json test_data/stretcher_handle.json
 
-# 3. 启动位姿桥接 (FoundationPose++ → StretcherTask/pose)
-# (待实现)
+# 3. 启动机器人控制循环 (提供 G1Env/env_state_act 给 controller 读 waist_pitch)
+python run_g1_control_loop.py
 
 # 4. 启动任务控制器
 python run_stretcher_task.py --start-phase approaching --single-phase
+# 多机时: --pose-topic-namespace robot1/FoundationPose/pose
 ```
 
 ### 调试命令
@@ -218,27 +225,11 @@ ros2 topic hz FoundationPose/pose/right_handle
 }
 ```
 
-### Pose Estimation (`StretcherTask/pose`)
-```python
-{
-    "left_handle": {
-        "position": [x, y, z],
-        "orientation": [w, x, y, z],  # Quaternion (scalar-first)
-    },
-    "right_handle": {
-        "position": [x, y, z],
-        "orientation": [w, x, y, z],
-    },
-    "ready_to_grab": bool,           # True when positioned correctly
-    "navigate_cmd": [vx, vy, wz],    # Optional fine-tuning command
-    "timestamp": float,
-}
-```
-
 ### FoundationPose++ 位姿输出 (`FoundationPose/pose/<object_id>`)
 
-每个跟踪物体一个独立 topic，`<object_id>` 来自 `objects.json` 的 `"id"` 字段。
-与 `StretcherTask/pose` 不同，这是 FoundationPose++ 原始输出，由 pose bridge 转换为 `StretcherTask/pose` 格式。
+每个跟踪物体一个独立 topic，`<object_id>` 来自 `objects.json` 的 `"id"` 字段
+(`left_handle` / `right_handle`)。**controller 直接订阅这两个独立 topic**,
+不再有 pose bridge 聚合。
 
 ```python
 # Topic: FoundationPose/pose/right_handle
@@ -256,6 +247,13 @@ ros2 topic hz FoundationPose/pose/right_handle
     "orientation_euler_rad": [rx, ry, rz],  # 欧拉角 (弧度)
 }
 ```
+
+> **controller 只读 `pose_robot_matrix`**: `StretcherHandle.from_msg()` 取该矩阵的
+> 平移列 `[:3, 3]` 作为 handle position (机器人坐标系 = IK 求解参考系 pelvis 系,
+> 由 `camera_to_robot` 静态变换完成, 已处理)。
+> `pose_camera_matrix` / `position` / `pose_6d` / `orientation_euler_rad` 均不读 ——
+> 手腕目标朝向不走 FP++ 估计, 而是固定世界系 `R_y(90°)` + 实测 `waist_pitch` 补偿
+> (见 `run_stretcher_task.py:_compute_wrist_orientation`)。
 
 ### Task Status (`StretcherTask/status`)
 ```python
@@ -275,23 +273,28 @@ ros2 topic hz FoundationPose/pose/right_handle
 │  (run_camera)   │     └─────────────┘     └──────┬──────┘
 │                 │     ┌─────────────┐            │
 │                 │────▶│ camera/head │     ┌──────▼──────┐
-│                 │     │ (RGB+Depth) │────▶│    Pose     │
-└─────────────────┘     └─────────────┘     │  Estimation │
+│                 │     │ (RGB+Depth) │────▶│FoundationPose│
+└─────────────────┘     └─────────────┘     │     ++        │
                                             └──────┬──────┘
-                                                   │
-┌─────────────┐     ┌─────────────┐            │
-│  VLN Model  │────▶│  nav_cmd    │────▶│                     │
-└─────────────┘     └─────────────┘     │                     │
-                                        │  Task Controller    │────▶ Robot Control Loop
-┌─────────────┐     ┌─────────────┐     │                     │
-│    Pose     │────▶│  pose       │────▶│                     │
-│  Estimation │     └─────────────┘     └─────────────────────┘
-└─────────────┘                                    │
+                                                   │ pose_robot_matrix
                                                    ▼
-                                          ┌─────────────────┐
-                                          │  Task Status    │
-                                          └─────────────────┘
+                       ┌──────────────────────┐ left/right_handle
+                       │   Task Controller    │◀─────┐
+┌─────────────┐ nav_cmd│                      │      │
+│  VLN Model  │───────▶│  (FineTuning: PD     │      │ G1Env/env_state_act
+└─────────────┘        │   自算 nav_cmd)       │────▶ Robot Control Loop
+                       │  GRABBING: lock+IK   │◀─────┘ (waist_pitch 补偿)
+                       └──────────┬───────────┘
+                                  │
+                                  ▼
+                         ┌─────────────────┐
+                         │  Task Status    │
+                         └─────────────────┘
 ```
+
+> 注: 不再有 pose bridge。FoundationPose++ 直接发两个独立 topic 给 controller;
+> controller 还订阅 `G1Env/env_state_act` 读实测 `waist_pitch`, 用于 IK 目标朝向
+> (世界系 R_y(90°)) 补偿到 pelvis 系。
 
 ## RealSense Camera Configuration
 
@@ -333,12 +336,14 @@ Auto-calibrated from RealSense SDK:
 - Subscribe to `StretcherTask/nav_cmd` topic
 - Publish navigation commands at 10-50 Hz
 - Set `arrived=True` when reaching the stretcher
+- 仅 `NAVIGATING` 阶段使用; `FINE_TUNING` 起改用内置 PD 自算 `nav_cmd`
 
-### Pose Estimation Integration
-- Subscribe to `StretcherTask/pose` topic
-- Publish handle poses at 10-50 Hz
-- Optionally include `navigate_cmd` for fine-tuning
-- Set `ready_to_grab=True` when positioned correctly
+### Pose Estimation Integration (FoundationPose++)
+- Controller 直接订阅两个独立 topic `FoundationPose/pose/{left,right}_handle`
+- 每个 handle 一条消息, controller 读 `pose_robot_matrix[:3,3]` 作 position
+- 朝向不读 FP++ 估计 —— 固定世界系 `R_y(90°)` + `G1Env/env_state_act` 的实测 `waist_pitch` 补偿到 pelvis 系
+- 多机区分: `--pose-topic-namespace <prefix>` 覆盖 topic 前缀
+- `GRABBING` 阶段对最近 N 帧取均值锁定 handle, 之后全程不刷新 (担架静止 + pose 抖动)
 
 ### Grab Script
 The grab script should:
@@ -346,6 +351,59 @@ The grab script should:
 2. Control the robot's hand actuators
 3. Handle the actual grasping motion
 4. Can be specified via `--grab-script` argument
+
+## CLI 参数 (`run_stretcher_task.py`)
+
+参数按阶段分组、按阶段顺序排列 (Global → NAVIGATING → FINE_TUNING → APPROACHING → GRABBING → STANDING_UP)。每个参数 `--help` 里也标了所属阶段。实机调的占位默认值见各参数说明。
+
+### Global / Runtime
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--start-phase` | `idle` | 起始阶段 |
+| `--auto-start` | off | 自动从 idle 进入 navigating |
+| `--single-phase` | off | 只跑 `--start-phase`, 完成后停 |
+| `--freq` | `50.0` | 发布频率 Hz |
+| `--duration` | None | 任务最长时长 (秒) |
+| `--pose-topic-namespace` | `FoundationPose/pose` | FP++ handle pose topic 前缀 (多机区分) |
+
+### NAVIGATING
+无本阶段专有参数 (订阅 `StretcherTask/nav_cmd`)。
+
+### FINE_TUNING (PD 微调)
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--finetune-target-handle-x` | `0.45` | 目标抓取窗 x (pelvis 系, 米, 实机调); y 收敛到 0 |
+| `--finetune-kp-x` / `-kp-y` / `-kp-theta` | `1.0` | x/y/θ 的 P 增益 (实机调; θ 符号实机验证) |
+| `--finetune-kd-x` / `-kd-y` / `-kd-theta` | `0.0` | x/y/θ 的 D 增益 (实机调; D 项对低通后误差求差分) |
+| `--finetune-d-alpha` | `0.5` | D 项 EWMA 低通系数 (0~1, 仅 D>0 时生效) |
+| `--finetune-max-nav-speed` | `0.1 0.1 0.1` | 输出 nav_cmd [vx vy vθ] 各维限幅 |
+| `--finetune-tol` | `0.03` | x/y 收敛阈值 (米) |
+| `--finetune-tol-theta` | `0.05` | θ 收敛阈值 (左右 handle x 差, 米, ~3°) |
+| `--finetune-converge-frames` | `10` | 误差连续低于阈值多少帧才退出 (防 pose 抖动假退出) |
+
+### APPROACHING (下蹲 + 弯腰)
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--approach-duration` | `2.0` | 下蹲+弯腰插值时长 (秒) |
+| `--target-height` | `0.34` | 弯腰目标 base_height (米) |
+| `--target-torso-rpy` | `0 60 0` | 目标 torso RPY (度) |
+
+### GRABBING (锁定 handle + IK 抓取)
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--grab-lock-settle-time` | `1.5` | settle 等位姿稳定时长 (秒, 期间订阅照常不发 command) |
+| `--grab-lock-window` | `10` | 锁定时取均值的最近帧数 |
+| `--grab-duration` | `3.0` | settle 后 IK 抓取时长 (秒, 不含 settle) |
+| `--move-duration` | `0.5` | IK 目标运动持续时间 (InterpolationPolicy 平滑过渡) |
+| `--grab-script` | None | 抓取脚本路径, 50% 进度时 subprocess 启动 |
+| `--default-left-wrist-position` | `0.25 0.3 0.1` | 左 handle 缺失 fallback position (pelvis 系, 米) |
+| `--default-right-wrist-position` | `0.25 -0.3 0.1` | 右 handle 缺失 fallback position |
+
+### STANDING_UP (抬起担架)
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--standup-duration` | `3.0` | 站起反向插值时长 (秒) |
+| `--standup-handle-z-target` | `0.0` | pelvis 系下手腕 z 最终目标 (米, 左右共用); xy 冻结 |
 
 ## File Structure
 

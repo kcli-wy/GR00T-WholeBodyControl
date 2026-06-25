@@ -208,7 +208,7 @@ class HandPosePublisher:
             robot_model=self.robot_model,
             left_hand_ik_solver=left_hand_ik_solver,
             right_hand_ik_solver=right_hand_ik_solver,
-            enable_visualization=False,
+            enable_visualization=True,
             body_active_joint_groups=["upper_body"],
         )
 
