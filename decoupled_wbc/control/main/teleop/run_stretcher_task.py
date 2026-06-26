@@ -1254,7 +1254,7 @@ Valid phases: idle, navigating, fine_tuning, approaching, grabbing, standing_up,
     parser.add_argument(
         "--grab-script",
         type=str,
-        default=str(Path(__file__).parent.parent.parent.parent / "brainco-hand-sdk/python/revo2" / "dual_thumb_aux.py"),
+        default=str(Path(__file__).parent.parent.parent.parent.parent / "brainco-hand-sdk/python/revo2" / "dual_thumb_aux.py"),
         help="[Grabbing] 抓取脚本路径, GRABBING 50% 进度时 subprocess 启动 "
              "(default: scripts/grab.sh, 相对本脚本所在目录; .sh 用 bash 执行, .py 用 python 执行)",
     )
@@ -1263,7 +1263,7 @@ Valid phases: idle, navigating, fine_tuning, approaching, grabbing, standing_up,
         "--default-left-wrist-position",
         type=float,
         nargs=3,
-        default=[0.25, 0.3, 0],
+        default=[0.4, 0.25, 0.15],
         metavar=("X", "Y", "Z"),
         help="[Grabbing] 左 handle 缺失时的 fallback position [x y z] (pelvis 系, 米, default: 0.25 0.3 0). "
              "朝向始终走 waist_pitch 补偿, 此处只给 position",
@@ -1272,7 +1272,7 @@ Valid phases: idle, navigating, fine_tuning, approaching, grabbing, standing_up,
         "--default-right-wrist-position",
         type=float,
         nargs=3,
-        default=[0.25, -0.3, 0],
+        default=[0.4, -0.25, 0.15],
         metavar=("X", "Y", "Z"),
         help="[Grabbing] 右 handle 缺失时的 fallback position [x y z] (pelvis 系, 米, default: 0.25 -0.3 0). "
              "朝向始终走 waist_pitch 补偿, 此处只给 position",

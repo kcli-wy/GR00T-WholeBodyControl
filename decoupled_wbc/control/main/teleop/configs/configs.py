@@ -121,7 +121,7 @@ class BaseConfig(ArgsConfigTemplate):
     enable_onscreen: bool = True
     """Whether to enable onscreen rendering."""
 
-    upper_body_joint_speed: float = 100
+    upper_body_joint_speed: float = 1000
     """Upper body joint speed."""
 
     env_name: str = "default"
@@ -137,7 +137,7 @@ class BaseConfig(ArgsConfigTemplate):
     """Keyboard dispatcher to use. [raw, ros]"""
 
     # Gravity Compensation Configuration
-    enable_gravity_compensation: bool = False
+    enable_gravity_compensation: bool = True
     """Enable gravity compensation using pinocchio dynamics."""
 
     gravity_compensation_joints: Optional[list[str]] = "arms"

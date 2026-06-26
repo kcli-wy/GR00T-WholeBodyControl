@@ -22,6 +22,7 @@ def retargeting_ik(request):
         right_hand_ik_solver=right_hand_ik_solver,
         enable_visualization=False,  # Change to true to visualize movements
         body_active_joint_groups=["upper_body"],
+        wrist_x_offset=0.0,  # Tests in this file compare FK wrist pose to target pose
     )
 
 
@@ -190,6 +191,73 @@ def test_ik_matches_fk(retargeting_ik, mode, side):
 
         max_rot_error = max(max_rot_error, rot_error_left)
         max_rot_error = max(max_rot_error, rot_error_right)
+
+    assert max_pos_error < 0.01 and max_rot_error < np.deg2rad(
+        1
+    ), f"Max position error: {max_pos_error}, Max rotation error: {np.rad2deg(max_rot_error)} deg"
+
+
+@pytest.fixture(params=["lower_body", "lower_and_upper_body"])
+def retargeting_ik_with_wrist_offset(request):
+    waist_location = request.param
+    robot_model = instantiate_g1_robot_model(waist_location=waist_location)
+    left_hand_ik_solver, right_hand_ik_solver = instantiate_g1_hand_ik_solver()
+    return TeleopRetargetingIK(
+        robot_model=robot_model,
+        left_hand_ik_solver=left_hand_ik_solver,
+        right_hand_ik_solver=right_hand_ik_solver,
+        enable_visualization=False,
+        body_active_joint_groups=["upper_body"],
+        wrist_x_offset=0.13,
+    )
+
+
+@pytest.mark.parametrize("side", ["left", "right", "both"])
+def test_ik_with_wrist_offset_matches_fk(retargeting_ik_with_wrist_offset, side):
+    """When wrist_x_offset is set, the body_data target is interpreted as the
+    desired pose of a frame displaced from the wrist along the wrist's local
+    x-axis. Verify that FK of the resulting wrist pose reproduces that
+    displaced frame pose."""
+    retargeting_ik = retargeting_ik_with_wrist_offset
+    full_robot = retargeting_ik.full_robot
+    offset = retargeting_ik.wrist_x_offset
+
+    # Build the forward offset transform (wrist -> displaced frame)
+    T_offset = np.eye(4)
+    T_offset[:3, 3] = np.array([offset, 0.0, 0.0])
+
+    body_data_list = generate_target_wrist_poses("translation", side, full_robot)
+
+    max_pos_error = 0
+    max_rot_error = 0
+
+    for body_data in body_data_list:
+        q = retargeting_ik.compute_joint_positions(
+            body_data,
+            left_hand_data=None,
+            right_hand_data=None,
+        )
+
+        full_robot.cache_forward_kinematics(q, auto_clip=False)
+        left_wrist_link = full_robot.supplemental_info.hand_frame_names["left"]
+        right_wrist_link = full_robot.supplemental_info.hand_frame_names["right"]
+
+        for wrist_link, target in [
+            (left_wrist_link, body_data[left_wrist_link]),
+            (right_wrist_link, body_data[right_wrist_link]),
+        ]:
+            T_fk_wrist = full_robot.frame_placement(wrist_link).np
+            # Displaced frame pose = wrist pose @ T_offset
+            T_fk_displaced = T_fk_wrist @ T_offset
+
+            pos_error = np.linalg.norm(T_fk_displaced[:3, 3] - target[:3, 3])
+            rot_diff = T_fk_displaced[:3, :3] @ target[:3, :3].T
+            rot_error = np.arccos(
+                np.clip((np.trace(rot_diff) - 1) / 2, -1, 1)
+            )
+
+            max_pos_error = max(max_pos_error, pos_error)
+            max_rot_error = max(max_rot_error, rot_error)
 
     assert max_pos_error < 0.01 and max_rot_error < np.deg2rad(
         1

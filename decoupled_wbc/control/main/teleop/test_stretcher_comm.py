@@ -174,8 +174,8 @@ class CommunicationTester:
                 t = time.monotonic() - start_time
 
                 # Simulate handle poses
-                left_pos = [0.3, 0.25, -0.0]
-                right_pos = [0.3, -0.25, 0.0]
+                left_pos =  [0.4,  0.25, 0.15]
+                right_pos = [0.4, -0.25, 0.15]
 
                 # Simulate fine-tuning navigation
                 nav_cmd = [0.0, 0.1, 0.0]  # Slight lateral movement
