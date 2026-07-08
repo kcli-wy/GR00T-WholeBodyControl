@@ -19,11 +19,6 @@ DEFAULT_STRETCHER_POSE_TOPIC_PREFIX = "FoundationPose/pose"
 STRETCHER_LEFT_HANDLE_ID = "left_handle"
 STRETCHER_RIGHT_HANDLE_ID = "right_handle"
 
-# Camera topics
-CAMERA_CHEST_TOPIC = "camera/chest"  # Chest camera for navigation (RGB only)
-CAMERA_HEAD_TOPIC = "camera/head"   # Head camera for pose estimation (RGB + Depth)
-
-
 DEFAULT_NAV_CMD = [0.0, 0.0, 0.0]
 DEFAULT_BASE_HEIGHT = 0.74
 DEFAULT_WRIST_POSE = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0] * 2  # x, y, z + w, x, y, z

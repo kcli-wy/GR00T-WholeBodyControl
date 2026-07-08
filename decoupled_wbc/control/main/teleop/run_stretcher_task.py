@@ -1255,7 +1255,7 @@ Valid phases: idle, navigating, fine_tuning, approaching, grabbing, standing_up,
         "--grab-script",
         type=str,
         default=str(Path(__file__).parent.parent.parent.parent.parent / "brainco-hand-sdk/python/revo2" / "dual_thumb_aux.py"),
-        help="[Grabbing] 抓取脚本路径, GRABBING 50% 进度时 subprocess 启动 "
+        help="[Grabbing] 抓取脚本路径, GRABBING 50%% 进度时 subprocess 启动 "
              "(default: scripts/grab.sh, 相对本脚本所在目录; .sh 用 bash 执行, .py 用 python 执行)",
     )
     # handle 缺失时的 IK fallback position (左右独立)
@@ -1288,8 +1288,8 @@ Valid phases: idle, navigating, fine_tuning, approaching, grabbing, standing_up,
     parser.add_argument(
         "--standup-handle-z-target",
         type=float,
-        default=0.0,
-        help="[StandingUp] pelvis 系下手腕 z 的最终目标 (米, 左右共用, default: 0.0). "
+        default= -0.15,
+        help="[StandingUp] pelvis 系下手腕 z 的最终目标 (米, 左右共用, default: -0.15). "
              "GRABBING 末尾的 z 沿直线插值到该值, xy 冻结",
     )
 

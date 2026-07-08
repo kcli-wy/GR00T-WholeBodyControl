@@ -2,73 +2,11 @@
 
 ## Overview
 
-G1 机器人抓担架任务的整套架构：相机发布、位姿估计、状态机控制器、抓取脚本，以及把它们串起来的 ROS2 topic。
+G1 机器人抓担架任务的整套架构：位姿估计、状态机控制器、抓取脚本，以及把它们串起来的 ROS2 topic。
 
 ## Components
 
-### 1. Camera Publisher
-
-#### RealSense Publisher (`run_realsense_publisher.py`)
-发布 Intel RealSense 相机图像。
-
-**Features:**
-- Auto-calibration intrinsics from RealSense SDK
-- Depth aligned to RGB
-- Post-processing filters (decimation, spatial, temporal, hole-filling)
-
-**Usage:**
-```bash
-# Publish both cameras
-python run_realsense_publisher.py
-
-# Publish only chest camera
-python run_realsense_publisher.py --camera chest
-
-# Publish only head camera
-python run_realsense_publisher.py --camera head
-```
-
-**Configuration:**
-Edit `run_realsense_publisher.py` to set camera serial numbers:
-```python
-CHEST_CAMERA_SERIAL = "1234567890"  # TODO: Fill in
-HEAD_CAMERA_SERIAL = "9876543210"   # TODO: Fill in
-```
-
-#### Camera Subscriber Test (`test_camera_sub.py`)
-订阅相机 topic，验证图像能否收到。
-
-**Usage:**
-```bash
-# Subscribe to all cameras
-python test_camera_sub.py --verbose
-
-# Subscribe with display (requires OpenCV)
-python test_camera_sub.py --display --verbose
-
-# Save images to directory
-python test_camera_sub.py --save-dir ./images --verbose
-```
-
-#### Camera Communication Test (`test_camera_publisher.py`)
-测试相机 ROS2 通信。
-
-**Usage:**
-```bash
-# Test all cameras
-python test_camera_publisher.py --verbose
-
-# Test specific camera
-python test_camera_publisher.py --camera chest --verbose
-```
-
-**Camera Configuration:**
-| Camera | Location | Purpose | Topic | Content |
-|--------|----------|---------|-------|---------|
-| Chest | Robot chest | Navigation/VLN | `camera/chest` | RGB only |
-| Head | Robot head | Pose estimation | `camera/head` | RGB + Depth |
-
-### 2. Stretcher Task Controller (`run_stretcher_task.py`)
+### 1. Stretcher Task Controller (`run_stretcher_task.py`)
 
 状态机控制器，跑完整任务的各个阶段。
 
@@ -97,7 +35,7 @@ python run_stretcher_task.py --interface sim \
     --grab-script scripts/grab.sh
 ```
 
-### 3. Communication Test (`test_stretcher_comm.py`)
+### 2. Communication Test (`test_stretcher_comm.py`)
 
 用 mock publisher 测 ROS2 通信，不依赖真实位姿估计和导航模型。
 
@@ -112,7 +50,7 @@ python test_stretcher_comm.py --test pose
 python test_stretcher_comm.py --test full
 ```
 
-### 4. Return to Init Pose (`run_return_to_init_pose.py`)
+### 3. Return to Init Pose (`run_return_to_init_pose.py`)
 
 只发 `target_upper_body_pose`，把双臂带回到 `run_g1_control_loop.py` 启动时的初始位置（`robot_model.get_initial_upper_body_pose()`，默认 `high_elbow_pose=True` 高肘姿态，与 `configs.py` 的 `BaseConfig` 默认一致）。
 
@@ -138,17 +76,9 @@ python run_return_to_init_pose.py --duration -1
 
 ## ROS2 Topics
 
-### Camera Topics (Constants in `constants.py`)
-| Constant | Topic | Description |
-|----------|-------|-------------|
-| `CAMERA_CHEST_TOPIC` | `camera/chest` | Chest camera RGB |
-| `CAMERA_HEAD_TOPIC` | `camera/head` | Head camera RGB + Depth |
-
 ### All Topics
 | Topic | Type | Publisher | Subscriber |
 |-------|------|-----------|------------|
-| `camera/chest` | ByteMultiArray (msgpack) | Camera Publisher | VLN Model |
-| `camera/head` | ByteMultiArray (msgpack) | Camera Publisher | FoundationPose++ |
 | `FoundationPose/pose/left_handle` | ByteMultiArray (msgpack) | FoundationPose++ | Task Controller |
 | `FoundationPose/pose/right_handle` | ByteMultiArray (msgpack) | FoundationPose++ | Task Controller |
 | `StretcherTask/nav_cmd` | ByteMultiArray (msgpack) | VLN Model | Task Controller (NAVIGATING) |
@@ -165,30 +95,33 @@ python run_return_to_init_pose.py --duration -1
 ### 启动流程
 
 ```bash
-# 1. 启动相机发布
-python run_realsense_publisher.py --camera head
-
-# 2. 启动 FoundationPose++ (conda activate foundationpose)
+# 1. 启动 FoundationPose++ (host 上, conda activate foundation310)
 #    发两个独立 topic: FoundationPose/pose/{left,right}_handle
-python /path/to/FoundationPose-plus-plus/src/obj_pose_track_ros2.py \
-    --objects_json test_data/stretcher_handle.json
+#    注意: host 跑 publisher 时也要 export ROS_LOCALHOST_ONLY=1, 与 docker 内对齐
+conda activate foundation310
+source /opt/ros/humble/setup.bash
+export ROS_LOCALHOST_ONLY=1
+python /path/to/FoundationPose-plus-plus/src/run_pose_publisher.py \
+    --objects_json /path/to/FoundationPose-plus-plus/configs/stretch.json
 
-# 3. 启动机器人控制循环 (提供 G1Env/env_state_act 给 controller 读 pelvis_pitch + waist_pitch)
+# 2. 启动机器人控制循环 (docker 内, 提供 G1Env/env_state_act 给 controller 读 pelvis_pitch + waist_pitch)
 python run_g1_control_loop.py
 
-# 4. 启动任务控制器
+# 3. 启动任务控制器 (docker 内)
 python run_stretcher_task.py --start-phase approaching --single-phase
 # 多机时: --pose-topic-namespace robot1/FoundationPose/pose
 ```
+
+> **跨 host/docker 通信**: `decoupled_wbc` 在 docker 内运行 (`--network=host`), docker 镜像
+> 强制 `ROS_LOCALHOST_ONLY=1` (见 `docker/Dockerfile.deploy` / `entrypoint/install_deps.sh`)。
+> host 上跑 FoundationPose++ publisher 时必须同样 `export ROS_LOCALHOST_ONLY=1`, 否则 DDS
+> 发现不通, controller 收不到 handle pose。两端都 localhost-only + 共享 loopback 即可互通。
 
 ### 调试命令
 
 ```bash
 # 查看 topic 列表
-ros2 topic list | grep -E "camera|FoundationPose|StretcherTask|ControlPolicy"
-
-# 查看相机消息 (不显示数组)
-ros2 topic echo camera/head --no-arr
+ros2 topic list | grep -E "FoundationPose|StretcherTask|ControlPolicy"
 
 # 查看 FoundationPose 位姿
 ros2 topic echo FoundationPose/pose/right_handle --no-arr
@@ -197,49 +130,10 @@ ros2 topic echo FoundationPose/pose/right_handle --no-arr
 ros2 topic echo StretcherTask/status
 
 # 查看发布频率
-ros2 topic hz camera/head
 ros2 topic hz FoundationPose/pose/right_handle
 ```
 
 ## Message Formats
-
-### Camera Chest Image (`camera/chest`)
-```python
-{
-    "rgb": np.ndarray,              # RGB image (H, W, 3) uint8
-    "camera_info": {
-        "width": int,
-        "height": int,
-        "fx": float,                # Focal length x
-        "fy": float,                # Focal length y
-        "cx": float,                # Principal point x
-        "cy": float,                # Principal point y
-        "distortion": [k1, k2, p1, p2, k3],
-    },
-    "timestamp": float,
-    "frame_id": str,                # "chest_camera"
-}
-```
-
-### Camera Head Image (`camera/head`)
-```python
-{
-    "rgb": np.ndarray,              # RGB image (H, W, 3) uint8
-    "depth": np.ndarray,            # Depth image (H, W) uint16, RealSense raw values (multiply by depth_scale to get meters), aligned to RGB
-    "camera_info": {
-        "width": int,
-        "height": int,
-        "fx": float,                # Focal length x
-        "fy": float,                # Focal length y
-        "cx": float,                # Principal point x
-        "cy": float,                # Principal point y
-        "distortion": [k1, k2, p1, p2, k3],
-        "depth_scale": float,       # Depth scale (meters/raw_unit), e.g. 0.001; depth_m = depth_raw * depth_scale
-    },
-    "timestamp": float,
-    "frame_id": str,                # "head_camera"
-}
-```
 
 ### Navigation Command (`StretcherTask/nav_cmd`)
 ```python
@@ -297,68 +191,30 @@ ros2 topic hz FoundationPose/pose/right_handle
 ## Data Flow
 
 ```
-┌─────────────────┐     ┌─────────────┐     ┌─────────────┐
-│ Camera Publisher │────▶│ camera/chest│────▶│  VLN Model  │
-│  (run_camera)   │     └─────────────┘     └──────┬──────┘
-│                 │     ┌─────────────┐            │
-│                 │────▶│ camera/head │     ┌──────▼──────┐
-│                 │     │ (RGB+Depth) │────▶│FoundationPose│
-└─────────────────┘     └─────────────┘     │     ++        │
-                                            └──────┬──────┘
-                                                   │ pose_robot_matrix
-                                                   ▼
-                       ┌──────────────────────┐ left/right_handle
-                       │   Task Controller    │◀─────┐
-┌─────────────┐ nav_cmd│                      │      │
-│  VLN Model  │───────▶│  (FineTuning: PD     │      │ G1Env/env_state_act
-└─────────────┘        │   自算 nav_cmd)       │────▶ Robot Control Loop
-                       │  GRABBING: lock+IK   │◀─────┘ (pelvis_pitch + waist_pitch 补偿)
-                       └──────────┬───────────┘
-                                  │
-                                  ▼
-                         ┌─────────────────┐
-                         │  Task Status    │
-                         └─────────────────┘
+                                          ┌──────────────┐
+  FoundationPose++                        │FoundationPose│
+  (相机图像外部输入)                        │     ++       │
+                                          └──────┬───────┘
+                                                 │ pose_robot_matrix
+                                                 ▼
+                     ┌──────────────────────┐ left/right_handle
+                     │   Task Controller    │◀─────┐
+┌─────────────┐nav_cmd│                      │      │
+│  VLN Model  │──────▶│  (FineTuning: PD     │      │ G1Env/env_state_act
+│(相机图像外部 │       │   自算 nav_cmd)       │────▶ Robot Control Loop
+│  输入)      │       │  GRABBING: lock+IK   │◀─────┘ (pelvis_pitch + waist_pitch 补偿)
+└─────────────┘      └──────────┬───────────┘
+                                │
+                                ▼
+                       ┌─────────────────┐
+                       │  Task Status    │
+                       └─────────────────┘
 ```
 
 > 注: 没有 pose bridge。FoundationPose++ 直接发两个独立 topic 给 controller。
 > controller 另外订阅 `G1Env/env_state_act`，读实测 `pelvis_pitch`（从 floating_base_pose
 > 四元数解出，腿关节造成）和 `waist_pitch`（`q[waist_pitch_idx]`，torso 相对 pelvis），
 > 两者相加用于把世界系 `R_y(90°)` 目标朝向补偿到 pelvis 系，详见下方"IK 目标朝向补偿"。
-
-## RealSense Camera Configuration
-
-### Default Settings
-| Parameter | Value |
-|-----------|-------|
-| Resolution | 640x480 |
-| FPS | 30 Hz |
-| Color Format | RGB8 |
-| Depth Format | Z16 (raw values, multiply by depth_scale ≈ 0.001 for meters) |
-| Depth Alignment | Aligned to RGB |
-
-### Post-Processing Filters
-| Filter | Parameters | Default |
-|--------|------------|---------|
-| Decimation | magnitude | 2 |
-| Spatial | alpha, delta, iterations | 0.5, 20, 1 |
-| Temporal | alpha, delta, persistence | 0.4, 20, 3 |
-| Hole-filling | mode | 1 (left) |
-
-### Intrinsics
-Auto-calibrated from RealSense SDK:
-```python
-{
-    "width": 640,
-    "height": 480,
-    "fx": float,  # Focal length x
-    "fy": float,  # Focal length y
-    "cx": float,  # Principal point x
-    "cy": float,  # Principal point y
-    "distortion": [k1, k2, p1, p2, k3],
-    "depth_scale": float,  # Depth scale (meters/raw_unit), e.g. 0.001
-}
-```
 
 ## Implementation Notes
 
@@ -510,7 +366,7 @@ GRABBING 阶段 50% 进度时，`subprocess.Popen` 非阻塞启动抓取脚本�
 | 参数 | 默认 | 说明 |
 |------|------|------|
 | `--standup-duration` | `3.0` | 站起反向插值时长 (秒) |
-| `--standup-handle-z-target` | `0.0` | pelvis 系下手腕 z 最终目标 (米, 左右共用); xy 冻结 |
+| `--standup-handle-z-target` | `-0.15` | pelvis 系下手腕 z 最终目标 (米, 左右共用); xy 冻结 |
 
 ## File Structure
 
@@ -518,16 +374,13 @@ GRABBING 阶段 50% 进度时，`subprocess.Popen` 非阻塞启动抓取脚本�
 control/main/teleop/
 ├── run_stretcher_task.py        # Task controller (state machine)
 ├── run_return_to_init_pose.py   # 发布上半身初始关节角, 双臂回零位
-├── run_realsense_publisher.py   # RealSense camera publisher
 ├── test_stretcher_comm.py       # Test VLN/Pose communication with mock publishers
-├── test_camera_publisher.py     # Test camera topic communication
-├── test_camera_sub.py           # Camera subscriber for testing reception
 ├── scripts/
 │   └── grab.sh                  # 手部抓取脚本 (GRABBING 50% 时 subprocess 启动)
 └── STRETCHER_TASK_README.md     # This file
 
 control/main/
-└── constants.py                 # Topic constants (CAMERA_CHEST_TOPIC, CAMERA_HEAD_TOPIC, etc.)
+└── constants.py                 # Topic constants
 ```
 
 ### Test Files说明
@@ -535,31 +388,15 @@ control/main/
 | 文件 | 用途 |
 |------|------|
 | `test_stretcher_comm.py` | 模拟 VLN 和位姿估计模型，测试与任务控制器的通信 |
-| `test_camera_publisher.py` | 测试相机 topic 通信是否正常 |
-| `test_camera_sub.py` | 订阅相机 topic，验证图像接收，支持显示/保存 |
 
 ## Quick Start
 
-### 1. Test with Real Cameras
+### 1. Test Full Task
 ```bash
-# Set serial numbers in run_realsense_publisher.py first
-
-# Terminal 1: Start RealSense publisher
-python run_realsense_publisher.py
-
-# Terminal 2: Verify reception
-python test_camera_sub.py --verbose --display
-```
-
-### 2. Test Full Task
-```bash
-# Terminal 1: Start camera publisher
-python run_realsense_publisher.py
-
-# Terminal 2: Start task controller (from grabbing phase)
+# Terminal 1: Start task controller (from grabbing phase)
 python run_stretcher_task.py --start-phase grabbing
 
-# Terminal 3: Monitor status
+# Terminal 2: Monitor status
 python test_stretcher_comm.py --test full
 ```
 
