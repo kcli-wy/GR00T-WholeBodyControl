@@ -1,5 +1,5 @@
 import time
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -25,7 +25,7 @@ class TeleopRetargetingIK(Policy):
         enable_visualization=False,
         body_active_joint_groups: Optional[List[str]] = None,
         body_ik_solver_settings_type: str = "default",
-        wrist_x_offset: float = 0.13,
+        wrist_offset: Tuple[float, float, float] = (0.13, 0.0, 0.0),
     ):
         # initialize the body
         if body_active_joint_groups is not None:
@@ -52,12 +52,12 @@ class TeleopRetargetingIK(Policy):
         self.right_hand_ik_solver = right_hand_ik_solver
 
         # Wrist frame offset: target pose is interpreted as a frame displaced from
-        # the wrist by wrist_x_offset along the wrist's local x-axis. We precompute
-        # the inverse homogeneous transform to map the displaced-frame target back
-        # to the wrist-frame target used by the body IK solver.
-        self.wrist_x_offset = wrist_x_offset
+        # the wrist by ``wrist_offset`` along the wrist's local x/y/z axes. We
+        # precompute the inverse homogeneous transform to map the displaced-frame
+        # target back to the wrist-frame target used by the body IK solver.
+        self.wrist_offset = np.array(wrist_offset, dtype=float)
         self._wrist_offset_inv = np.eye(4)
-        self._wrist_offset_inv[:3, 3] = np.array([-wrist_x_offset, 0.0, 0.0])
+        self._wrist_offset_inv[:3, 3] = -self.wrist_offset
 
         # enable visualizer
         self.enable_visualization = enable_visualization
@@ -93,16 +93,16 @@ class TeleopRetargetingIK(Policy):
         Convert displaced-frame targets back to wrist-frame targets.
 
         The solver task is registered on the wrist frame (e.g. left_wrist_yaw_link).
-        When ``wrist_x_offset > 0``, the provided target pose is interpreted as the
-        desired pose of a frame displaced by ``wrist_x_offset`` along the wrist's
-        local x-axis. To make the wrist-frame task reach the equivalent pose, we map
-        the target back by the inverse offset:
+        When ``wrist_offset`` is non-zero, the provided target pose is interpreted
+        as the desired pose of a frame displaced from the wrist by ``wrist_offset``
+        along the wrist's local x/y/z axes. To make the wrist-frame task reach the
+        equivalent pose, we map the target back by the inverse offset:
 
             T_wrist_target = T_displaced_target @ inv(T_offset)
 
         Non-wrist targets are copied through unchanged.
         """
-        if self.wrist_x_offset == 0.0 or not body_target_pose:
+        if not np.any(self.wrist_offset) or not body_target_pose:
             return body_target_pose
 
         offset_body_target_pose = {}

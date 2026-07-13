@@ -289,9 +289,10 @@ T[:3, 3] = handle.position                       # position 不补偿 (见下)
 - `TeleopRetargetingIK(body_active_joint_groups=["upper_body"])` 走 `ReducedRobotModel`，把
   waist/legs 锁死在 q0（全零位），IK 只解双臂 14 关节加双手。
 - 目标 frame: `left_wrist_yaw_link` / `right_wrist_yaw_link`（`hand_frame_names`）。
-- wrist offset: `TeleopRetargetingIK` 默认 `wrist_x_offset=0.13`。求解时把输入的 handle
-  position 当成手腕前方 0.13 m 处虚拟 frame 的目标位置，再反推 wrist frame 该去哪，这样实际
-  抓握点会落在 handle 上，而不是让手腕 yaw link 去对齐 handle。offset 方向已在实机上验证。
+- wrist offset: `TeleopRetargetingIK` 默认 `wrist_offset=(0.13, 0.0, 0.0)`。求解时把输入的 handle
+  position 当成手腕局部 x 轴前方 0.13 m 处虚拟 frame 的目标位置，再反推 wrist frame 该去哪，这样实际
+  抓握点会落在 handle 上，而不是让手腕 yaw link 去对齐 handle。offset 支持 x/y/z 三轴（沿 wrist
+  局部坐标系），y/z 分量默认 0；offset 方向已在实机上验证。
 
 **debug 输出** (GRABBING/STANDING_UP 调 `_solve_ik_for_handles` 时打印):
 

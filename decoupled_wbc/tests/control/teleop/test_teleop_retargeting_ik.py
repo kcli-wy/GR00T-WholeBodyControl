@@ -22,7 +22,7 @@ def retargeting_ik(request):
         right_hand_ik_solver=right_hand_ik_solver,
         enable_visualization=False,  # Change to true to visualize movements
         body_active_joint_groups=["upper_body"],
-        wrist_x_offset=0.0,  # Tests in this file compare FK wrist pose to target pose
+        wrist_offset=(0.0, 0.0, 0.0),  # Tests in this file compare FK wrist pose to target pose
     )
 
 
@@ -208,23 +208,23 @@ def retargeting_ik_with_wrist_offset(request):
         right_hand_ik_solver=right_hand_ik_solver,
         enable_visualization=False,
         body_active_joint_groups=["upper_body"],
-        wrist_x_offset=0.13,
+        wrist_offset=(0.13, 0.0, 0.0),
     )
 
 
 @pytest.mark.parametrize("side", ["left", "right", "both"])
 def test_ik_with_wrist_offset_matches_fk(retargeting_ik_with_wrist_offset, side):
-    """When wrist_x_offset is set, the body_data target is interpreted as the
+    """When wrist_offset is set, the body_data target is interpreted as the
     desired pose of a frame displaced from the wrist along the wrist's local
-    x-axis. Verify that FK of the resulting wrist pose reproduces that
+    x/y/z axes. Verify that FK of the resulting wrist pose reproduces that
     displaced frame pose."""
     retargeting_ik = retargeting_ik_with_wrist_offset
     full_robot = retargeting_ik.full_robot
-    offset = retargeting_ik.wrist_x_offset
+    offset = retargeting_ik.wrist_offset
 
     # Build the forward offset transform (wrist -> displaced frame)
     T_offset = np.eye(4)
-    T_offset[:3, 3] = np.array([offset, 0.0, 0.0])
+    T_offset[:3, 3] = np.array(offset)
 
     body_data_list = generate_target_wrist_poses("translation", side, full_robot)
 

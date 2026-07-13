@@ -246,17 +246,17 @@ class G1GearWbcPolicy(Policy):
         elif key == "o":
             self.use_policy_action = False
         elif key == "w":
-            self.cmd[0] += 0.2
+            self.cmd[0] += 0.05
         elif key == "s":
-            self.cmd[0] -= 0.2
+            self.cmd[0] -= 0.05
         elif key == "a":
-            self.cmd[1] += 0.2
+            self.cmd[1] += 0.05
         elif key == "d":
-            self.cmd[1] -= 0.2
+            self.cmd[1] -= 0.05
         elif key == "q":
-            self.cmd[2] += 0.2
+            self.cmd[2] += 0.05
         elif key == "e":
-            self.cmd[2] -= 0.2
+            self.cmd[2] -= 0.05
         elif key == "z":
             self.cmd[0] = 0.0
             self.cmd[1] = 0.0
